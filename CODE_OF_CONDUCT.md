@@ -102,3 +102,13 @@ Depending on the severity of the violation, actions may include:
 This Code of Conduct is adapted from the Contributor Covenant, version 2.1.
 
 https://www.contributor-covenant.org/version/2/1/code_of_conduct/
+
+---
+
+## Our Mission
+
+The Humanitarian Connection Protocol exists to improve humanitarian coordination through open standards and interoperable information.
+
+Every contribution should help advance this mission by promoting collaboration, trust and respect for affected communities.
+
+Technology is only valuable when it serves people.
