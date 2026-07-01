@@ -187,6 +187,16 @@ consume this implementation through public interfaces.
 
 # Long-Term Vision
 
+# Architecture Philosophy
+
+The Humanitarian Connection Protocol does not distribute aid.
+
+The Humanitarian Connection Protocol standardizes humanitarian information.
+
+By creating interoperable humanitarian records, HCP enables trustworthy collaboration between organizations and allows humanitarian applications to connect affected people with those willing to help.
+
+**Standardize data. Enable trust. Decentralize aid.**
+
 The HCP Reference implementation aims to become the canonical implementation of the Humanitarian Connection Protocol, serving governments, NGOs, humanitarian organizations and open-source projects around the world.
 
 The implementation should remain modular, interoperable and independent from any specific humanitarian initiative.
