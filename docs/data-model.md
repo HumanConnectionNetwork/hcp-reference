@@ -1,179 +1,229 @@
-# HCP Data Model
+# HCP Reference Data Model
 
-## Purpose
+## Overview
 
-The Humanitarian Connection Protocol (HCP) defines a common data model for recording, validating and exchanging humanitarian information.
+This document describes the conceptual data model used by the HCP Reference Implementation.
 
-Its goal is not to prescribe how applications store information internally, but to ensure that humanitarian information can be exchanged consistently between independent systems.
+The data model follows the Humanitarian Connection Protocol (HCP) specification and is intentionally centered on **humanitarian observations**, not personal identities.
 
-Every HCP-compatible implementation should represent these core entities, regardless of programming language, database technology or user interface.
-
----
-
-# Design Principles
-
-The HCP data model is based on the following principles:
-
-- Human-centered
-- Organization-independent
-- Interoperable
-- Extensible
-- Versionable
-- Privacy-aware
+The objective of the model is to support interoperability between independent HCP Nodes while preserving immutability, decentralization and privacy.
 
 ---
 
-# Core Entities
+# Core Design Principle
 
-HCP defines the following conceptual entities.
+The HCP data model stores **Humanitarian Records**.
 
-## Humanitarian Identity
+It does **not** store people.
 
-Represents the unique humanitarian identity of an individual.
+A Humanitarian Record may contain information reported about an individual involved in a humanitarian event, but the protocol never creates or manages a persistent identity.
 
-A Humanitarian Identity is created when a person is first registered by an HCP-compatible organization.
-
-It is independent of:
-
-- National ID
-- Passport
-- Government systems
-- Specific organizations
-
-Its purpose is to uniquely identify a person within humanitarian operations while minimizing duplication.
+Instead, it stores immutable observations.
 
 ---
 
-## Humanitarian Record
+# Conceptual Model
 
-Represents a standardized record describing the humanitarian situation of a person or household.
+```text
+Humanitarian Record
+        │
+        ├── Metadata
+        ├── Event Classification
+        ├── Observation
+        ├── Source
+        ├── Signature
+        └── Synchronization Metadata
+```
 
-A record may include:
-
-- personal information
-- household composition
-- location
-- vulnerability assessment
-- current status
-- humanitarian needs
-- previous assistance
-- verification history
-
-A Humanitarian Record evolves over time through events.
+Additional processing components operate on these records without modifying them.
 
 ---
 
-## Organization
+# Primary Entities
 
-Represents an organization participating in the humanitarian ecosystem.
+The reference implementation is organized around the following conceptual entities.
+
+---
+
+# Humanitarian Record
+
+The Humanitarian Record is the fundamental unit of information exchanged by HCP.
+
+Every record represents one humanitarian observation made at a specific moment.
+
+Responsibilities:
+
+- unique identifier
+- timestamp
+- humanitarian observation
+- event classification
+- source metadata
+- synchronization metadata
+
+Records are immutable.
+
+---
+
+# Event Classification
+
+Defines the standardized humanitarian event vocabulary.
 
 Examples include:
 
-- NGOs
-- Government agencies
-- International organizations
-- Community groups
-- Volunteer networks
+- Missing Person Observation
+- Hospital Admission
+- Rescue Completed
+- Shelter Registration
+- Food Distribution
+- Building Collapse
 
-Organizations create and update humanitarian records according to the HCP Specification.
-
----
-
-## Humanitarian Worker
-
-Represents an authenticated individual acting on behalf of an organization.
-
-Workers may:
-
-- register people
-- update records
-- perform assessments
-- verify information
-
-Every action performed by a worker should be traceable.
+The classification enables interoperability between independent implementations.
 
 ---
 
-## Household
+# Observation
 
-Represents a family or group of individuals sharing humanitarian circumstances.
+Represents the humanitarian information reported at the time the record was created.
 
-Multiple Humanitarian Identities may belong to the same household.
+Typical information may include:
 
----
+- reported name
+- estimated age
+- estimated location
+- humanitarian status
+- textual description
 
-## Assessment
+The observation reflects what was known at that moment.
 
-Represents the evaluation of humanitarian conditions.
-
-Assessments may describe:
-
-- shelter
-- food security
-- health
-- water
-- sanitation
-- protection
-- education
-- other humanitarian dimensions
-
-Assessments generate structured information rather than free-text descriptions whenever possible.
+It is never updated.
 
 ---
 
-## Humanitarian Need
+# Source
 
-Represents an identified need resulting from an assessment.
+Describes where the observation originated.
 
 Examples:
 
-- Food
-- Drinking water
-- Shelter
-- Medicine
-- Transportation
-- Clothing
-- Communication
-- Financial support
+- Hospital
+- Fire Department
+- Civil Defense
+- NGO
+- Volunteer
+- Family Member
 
-Needs are standardized to facilitate interoperability.
+The source contributes to trust evaluation but does not determine truth.
 
 ---
 
-## Humanitarian Event
+# Node Identity
 
-Represents any significant change affecting a Humanitarian Record.
+Represents the HCP Node that created or synchronized the record.
+
+Typical attributes include:
+
+- Node UUID
+- public identity
+- federation membership
+- protocol version
+
+Node Identity belongs to the node.
+
+It does not describe the observed individual.
+
+---
+
+# Correlation Candidate
+
+Represents a temporary analytical result.
+
+It estimates that multiple Humanitarian Records may describe the same humanitarian situation.
+
+Correlation Candidates are generated dynamically.
+
+They are not synchronized as Humanitarian Records.
+
+---
+
+# Trust Evaluation
+
+Represents the confidence assigned to one or more observations.
+
+Trust may consider:
+
+- source reliability
+- observation consistency
+- independent confirmations
+- historical behavior
+
+Trust is calculated.
+
+It is not stored as part of the original Humanitarian Record.
+
+---
+
+# Search Request
+
+Represents a humanitarian search performed by a user or another node.
+
+Typical fields include:
+
+- reported name
+- estimated age
+- event classification
+- location
+- date range
+- keywords
+
+Search Requests are transient.
+
+---
+
+# Search Response
+
+Represents the ordered result returned by a search operation.
+
+Contains:
+
+- Humanitarian Records
+- Correlation Candidates
+- Trust Scores
+- ranking information
+
+The response never identifies individuals with certainty.
+
+---
+
+# Synchronization Metadata
+
+Synchronization metadata supports record exchange between nodes.
 
 Examples include:
 
-- Person Registered
-- Household Created
-- Assessment Completed
-- Need Identified
-- Record Updated
-- Verification Completed
-- Assistance Delivered
+- synchronization timestamp
+- originating node
+- protocol version
+- signature status
 
-The protocol is event-oriented.
-
-Records evolve through events instead of being overwritten.
+Synchronization metadata never alters the original observation.
 
 ---
 
-## Verification
+# Federation Peer
 
-Represents the verification status of humanitarian information.
+Represents another HCP Node known to the local implementation.
 
-Verification increases trust between independent organizations.
+Typical attributes:
 
-Possible verification methods may include:
+- Node UUID
+- endpoint
+- federation
+- supported protocol version
+- synchronization capabilities
 
-- Field verification
-- Organization verification
-- Community verification
-- Multi-source verification
+Peer information is operational metadata.
 
-The protocol does not prescribe a single verification mechanism.
+It is independent from Humanitarian Records.
 
 ---
 
@@ -181,104 +231,137 @@ The protocol does not prescribe a single verification mechanism.
 
 The conceptual relationships are illustrated below.
 
-```
-Organization
-      │
-      │
-      ▼
-Humanitarian Worker
-      │
-      │
-      ▼
-Humanitarian Identity
-      │
-      ▼
+```text
+Node
+ │
+ ├──────────────┐
+ │              │
+ ▼              ▼
 Humanitarian Record
-      │
-      ├──────────────┐
-      ▼              ▼
- Household      Assessment
-                      │
-                      ▼
-              Humanitarian Need
-                      │
-                      ▼
-              Humanitarian Event
-                      │
-                      ▼
-                Verification
+        │
+        ├── Event Classification
+        ├── Observation
+        ├── Source
+        └── Synchronization Metadata
+                │
+                ▼
+         Correlation Candidate
+                │
+                ▼
+          Trust Evaluation
+                │
+                ▼
+          Search Response
 ```
 
 ---
 
-# Record Lifecycle
+# Immutability
 
-A Humanitarian Record typically follows this lifecycle.
+Once created:
 
-```
-Registration
-
-↓
-
-Assessment
-
-↓
-
-Needs Identified
-
-↓
-
-Verification
-
-↓
-
-Updates
-
-↓
-
-Assistance History
-
-↓
-
-Closure (optional)
+```text
+Humanitarian Record
 ```
 
-Records should remain historically traceable.
+must never be modified.
 
-Information is updated through protocol events rather than destructive modifications.
+Instead:
 
----
+```text
+Observation A
 
-# Versioning
+↓
 
-Every Humanitarian Record should include version information.
+Observation B
 
-Changes must preserve historical integrity.
+↓
 
-Compatible implementations should support future protocol versions without losing existing information.
+Observation C
+```
 
----
-
-# Interoperability
-
-Applications may extend their internal data models.
-
-However, every HCP-compatible implementation must preserve compatibility with the core entities defined by the protocol.
-
-Extensions must never compromise interoperability.
+The humanitarian timeline is reconstructed dynamically.
 
 ---
 
-# Relationship with Humanitarian Applications
+# Local Storage
 
-The HCP data model standardizes humanitarian information.
+Nodes may implement any storage technology.
 
-Applications such as Red Conexión Humana consume this standardized information to provide services including:
+Examples include:
 
-- humanitarian coordination
-- direct aid connections
-- reporting
-- logistics
-- analytics
+- PostgreSQL
+- SQLite
+- MySQL
+- MongoDB
+- distributed databases
+- embedded storage
 
-The protocol itself remains independent from any specific humanitarian application.
+The protocol does not mandate a storage engine.
+
+---
+
+# Local Extensions
+
+Implementations may create additional internal entities.
+
+Examples include:
+
+- authentication users
+- federation configuration
+- audit logs
+- synchronization queues
+- cache tables
+- search indexes
+
+These internal entities are outside the HCP protocol.
+
+---
+
+# Outside the Scope of HCP
+
+The following concepts are intentionally excluded from the HCP data model:
+
+- persistent personal identities
+- medical records
+- hospital information systems
+- donor databases
+- beneficiary management
+- case management systems
+- financial transactions
+- biometric repositories
+- government registries
+
+Applications may maintain such data independently.
+
+They are not synchronized through HCP.
+
+---
+
+# Reference Implementation Philosophy
+
+The HCP Reference Implementation separates:
+
+- storage;
+- search;
+- correlation;
+- trust;
+- synchronization;
+- federation;
+- security.
+
+Each module has a single responsibility.
+
+This modularity allows future implementations to replace individual components without changing protocol behavior.
+
+---
+
+# Summary
+
+The HCP data model is centered on immutable Humanitarian Records.
+
+Records describe humanitarian observations rather than individuals.
+
+Additional components such as Correlation Candidate, Trust Evaluation and Search Responses are derived dynamically from these observations.
+
+This model preserves interoperability, decentralization and privacy while remaining faithful to the principles defined by the Humanitarian Connection Protocol.
