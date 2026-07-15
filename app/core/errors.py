@@ -1,4 +1,3 @@
-python
 class HCPReferenceError(Exception):
     """
     Base exception for the HCP Reference Implementation.
