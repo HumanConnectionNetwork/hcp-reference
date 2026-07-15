@@ -1,4 +1,4 @@
-```python
+python
 from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID, uuid4
@@ -123,4 +123,3 @@ class HumanitarianCase(HCPModel):
         stored independently.
         """
         return [result.record_id for result in self.results]
-```
