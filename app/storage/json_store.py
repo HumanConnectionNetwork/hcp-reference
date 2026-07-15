@@ -1,4 +1,4 @@
-```python
+python
 import json
 from pathlib import Path
 from uuid import UUID
@@ -178,5 +178,4 @@ class JSONRecordStorage(RecordStorage):
             raise StorageError(
                 f"Unable to write JSON storage: {self.file_path}"
             ) from exc
-```
 
