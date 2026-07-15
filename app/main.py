@@ -1,4 +1,4 @@
-```python
+python
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -80,4 +80,3 @@ def create_application() -> FastAPI:
 
 
 app = create_application()
-```
