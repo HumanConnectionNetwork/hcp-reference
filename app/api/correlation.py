@@ -1,3 +1,4 @@
+```python
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -63,6 +64,7 @@ class CorrelationResponse(BaseModel):
 @router.post(
     "",
     response_model=CorrelationResponse,
+    response_model_exclude_none=True,
     summary="Correlate Humanitarian Records",
     description=(
         "Search locally stored Humanitarian Records and calculate "
@@ -169,4 +171,5 @@ def correlate_humanitarian_records(
                 "message": str(exc),
             },
         ) from exc
+```
 
