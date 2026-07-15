@@ -1,3 +1,4 @@
+```python
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
@@ -26,6 +27,7 @@ record_service = RecordService(storage)
 @router.post(
     "",
     response_model=HumanitarianRecord,
+    response_model_exclude_none=True,
     status_code=status.HTTP_201_CREATED,
     summary="Create a Humanitarian Record",
     description=(
@@ -77,6 +79,7 @@ def create_humanitarian_record(
 @router.get(
     "/{record_id}",
     response_model=HumanitarianRecord,
+    response_model_exclude_none=True,
     summary="Get a Humanitarian Record by ID",
     description=(
         "Retrieve one locally stored Humanitarian Record using its UUID."
@@ -121,5 +124,5 @@ def get_humanitarian_record(
                 "message": str(exc),
             },
         ) from exc
-
+```
 
