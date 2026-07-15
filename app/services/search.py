@@ -1,4 +1,3 @@
-python
 import unicodedata
 from collections.abc import Iterable
 
