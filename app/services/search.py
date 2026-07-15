@@ -1,4 +1,4 @@
-```python
+python
 import unicodedata
 from collections.abc import Iterable
 
@@ -234,5 +234,4 @@ class SearchService:
         )
 
         return " ".join(alphanumeric_text.split())
-```
 
