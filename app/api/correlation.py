@@ -1,4 +1,4 @@
-```python
+python
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -170,5 +170,4 @@ def correlate_humanitarian_records(
                 "message": str(exc),
             },
         ) from exc
-```
 
