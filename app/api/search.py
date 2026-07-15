@@ -1,3 +1,4 @@
+```python
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -45,6 +46,7 @@ class SearchResponse(BaseModel):
 @router.post(
     "",
     response_model=SearchResponse,
+    response_model_exclude_none=True,
     summary="Search Humanitarian Records",
     description=(
         "Search locally stored Humanitarian Records using a structured HCP "
@@ -109,4 +111,5 @@ def search_humanitarian_records(
                 "message": str(exc),
             },
         ) from exc
+```
 
