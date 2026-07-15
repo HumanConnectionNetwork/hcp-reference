@@ -1,4 +1,3 @@
-python
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import UUID
