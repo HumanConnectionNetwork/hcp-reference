@@ -1,4 +1,3 @@
-python
 import unicodedata
 from difflib import SequenceMatcher
 
