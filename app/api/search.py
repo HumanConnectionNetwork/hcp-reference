@@ -110,5 +110,4 @@ def search_humanitarian_records(
                 "message": str(exc),
             },
         ) from exc
-```
 
