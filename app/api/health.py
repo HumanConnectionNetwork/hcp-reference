@@ -1,4 +1,4 @@
-```python
+python
 from typing import Literal
 
 from fastapi import APIRouter
@@ -42,5 +42,4 @@ def health_check() -> HealthResponse:
         service=APP_NAME,
         version=APP_VERSION,
     )
-```
 
