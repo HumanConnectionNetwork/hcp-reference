@@ -1,4 +1,4 @@
-```python
+python
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import UUID
@@ -135,5 +135,4 @@ class HumanitarianRecord(HCPModel):
         Serialize the record UUID as its canonical lowercase string.
         """
         return str(value)
-```
 
