@@ -1,4 +1,4 @@
-```python
+python
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
@@ -122,5 +122,5 @@ def get_humanitarian_record(
                 "message": str(exc),
             },
         ) from exc
-```
+
 
