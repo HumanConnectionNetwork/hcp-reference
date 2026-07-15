@@ -1,4 +1,4 @@
-```python
+python
 class HCPReferenceError(Exception):
     """
     Base exception for the HCP Reference Implementation.
@@ -53,5 +53,4 @@ class CorrelationProcessingError(HCPReferenceError):
     """
     Raised when local correlation cannot be completed.
     """
-```
 
