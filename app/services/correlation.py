@@ -1,4 +1,4 @@
-```python
+python
 import unicodedata
 from difflib import SequenceMatcher
 
@@ -597,5 +597,4 @@ class CorrelationService:
         )
 
         return " ".join(alphanumeric_text.split())
-```
 
