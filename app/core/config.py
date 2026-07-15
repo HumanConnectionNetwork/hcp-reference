@@ -1,4 +1,4 @@
-```python
+python
 from pathlib import Path
 from typing import Final
 
@@ -26,5 +26,4 @@ def ensure_data_directory() -> None:
     protocol semantics.
     """
     DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
-```
 
