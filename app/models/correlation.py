@@ -1,4 +1,3 @@
-python
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
