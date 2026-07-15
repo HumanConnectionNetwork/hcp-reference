@@ -1,4 +1,4 @@
-```python
+python
 from abc import ABC, abstractmethod
 from uuid import UUID
 
@@ -62,5 +62,4 @@ class RecordStorage(ABC):
             StorageError:
                 If persisted data cannot be read.
         """
-```
 
