@@ -1,4 +1,4 @@
-```python
+python
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
@@ -161,5 +161,4 @@ def confidence_from_score(score: float) -> CorrelationConfidence:
         return CorrelationConfidence.LOW
 
     return CorrelationConfidence.VERY_LOW
-```
 
