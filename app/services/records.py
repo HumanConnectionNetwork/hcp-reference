@@ -1,4 +1,4 @@
-```python
+python
 from uuid import UUID
 
 from app.models.humanitarian_record import HumanitarianRecord
@@ -53,5 +53,4 @@ class RecordService:
         Return whether a Humanitarian Record exists locally.
         """
         return self.storage.exists(record_id)
-```
 
