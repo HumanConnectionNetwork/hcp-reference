@@ -123,5 +123,4 @@ def get_humanitarian_record(
                 "message": str(exc),
             },
         ) from exc
-```
 
