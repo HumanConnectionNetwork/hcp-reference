@@ -1,4 +1,3 @@
-python
 from uuid import UUID
 
 from app.models.humanitarian_record import HumanitarianRecord
