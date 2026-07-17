@@ -8,7 +8,6 @@ from app.models.correlation import (
     CorrelationSignalStatus,
     confidence_from_score,
 )
-from app.models.humanitarian_case import HumanitarianCase
 from app.models.humanitarian_record import HumanitarianRecord
 from app.models.query import HumanitarianQuery
 
@@ -20,8 +19,15 @@ class CorrelationService:
     Correlation estimates how compatible a Humanitarian Record is with the
     evidence supplied in a Humanitarian Query.
 
-    It does not verify identity and must not present results as confirmed
-    matches.
+    It does not:
+
+    - verify identity;
+    - create Humanitarian Cases;
+    - modify Humanitarian Records;
+    - persist correlation results;
+    - present candidates as confirmed matches.
+
+    Humanitarian Case construction belongs to HumanitarianCaseBuilder.
     """
 
     REPORTED_LABEL_WEIGHT = 30.0
@@ -111,6 +117,7 @@ class CorrelationService:
         Correlate one Query with one Humanitarian Record.
 
         Only evidence supplied by the Query participates in the score.
+
         Missing record evidence is reported as unavailable and does not count
         as either a match or a conflict.
         """
@@ -174,45 +181,6 @@ class CorrelationService:
             signals=signals,
         )
 
-    def generate_case(
-        self,
-        query: HumanitarianQuery,
-        results: list[CorrelationResult],
-    ) -> HumanitarianCase:
-        """
-        Generate a local Humanitarian Case from correlation results.
-
-        The case is a derived local interpretation. It does not alter or
-        replace the original Humanitarian Records.
-        """
-        if not results:
-            raise CorrelationProcessingError(
-                "A Humanitarian Case requires at least one correlation result"
-            )
-
-        strongest_result = max(
-            results,
-            key=lambda result: result.score,
-        )
-
-        reasoning = (
-            f"Generated from {len(results)} locally correlated "
-            f"Humanitarian Record candidate"
-            f"{'' if len(results) == 1 else 's'}. "
-            f"The strongest candidate has a score of "
-            f"{strongest_result.score:.2f} and confidence "
-            f"'{strongest_result.confidence.value}'. "
-            "The case represents probabilistic compatibility between "
-            "humanitarian observations and requires human verification."
-        )
-
-        return HumanitarianCase(
-            subject_type=query.subject.type,
-            query=query,
-            results=results,
-            reasoning=reasoning,
-        )
-
     def _append_text_signal(
         self,
         signals: list[CorrelationSignal],
@@ -250,6 +218,7 @@ class CorrelationService:
         )
 
         status = self._similarity_status(similarity)
+
         contribution = self._contribution_for_similarity(
             similarity=similarity,
             status=status,
@@ -375,6 +344,7 @@ class CorrelationService:
             status = CorrelationSignalStatus.MATCH
             contribution = weight
             explanation = f"The {description} values are equal."
+
         else:
             status = CorrelationSignalStatus.CONFLICT
             contribution = 0.0
@@ -541,6 +511,7 @@ class CorrelationService:
                 len(first_normalized),
                 len(second_normalized),
             )
+
             longest_length = max(
                 len(first_normalized),
                 len(second_normalized),
@@ -596,4 +567,3 @@ class CorrelationService:
         )
 
         return " ".join(alphanumeric_text.split())
-
