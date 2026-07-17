@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.api.correlation import router as correlation_router
 from app.api.health import router as health_router
 from app.api.records import router as records_router
 from app.api.search import router as search_router
@@ -51,7 +50,6 @@ def create_application() -> FastAPI:
     application.include_router(health_router)
     application.include_router(records_router)
     application.include_router(search_router)
-    application.include_router(correlation_router)
 
     @application.get(
         "/",
