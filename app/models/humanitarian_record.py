@@ -31,9 +31,7 @@ CountryCode = Annotated[
         min_length=2,
         max_length=2,
         pattern=r"^[A-Z]{2}$",
-        description=(
-            "ISO 3166-1 alpha-2 country code."
-        ),
+        description="ISO 3166-1 alpha-2 country code.",
     ),
 ]
 
@@ -42,9 +40,9 @@ class HCPModel(BaseModel):
     """
     Base model shared by canonical HCP data structures.
 
-    Unknown optional fields are preserved to support compatible protocol
-    evolution. Recognized string values are stripped of surrounding
-    whitespace before validation.
+    Unknown fields are preserved to support compatible protocol evolution.
+    Recognized string values are stripped of surrounding whitespace before
+    validation.
     """
 
     model_config = ConfigDict(
@@ -65,18 +63,25 @@ class DeclaredLocation(HCPModel):
     - an automatically detected location;
     - proof that the Subject was physically present at that location.
 
-    It represents the geographic context voluntarily declared by the person
-    or client contributing the Humanitarian Record.
+    It represents geographic context voluntarily declared by the person or
+    client contributing the Humanitarian Record.
 
-    Geographic levels use internationally neutral field names so HCP does
-    not depend on the administrative vocabulary of one country.
+    Geographic levels use internationally neutral field names:
 
-    User-facing clients may display localized labels such as:
+    - country_code:
+      ISO 3166-1 alpha-2 country code;
 
-    - State, Province or Region for admin_level_1;
-    - Municipality, County or Department for admin_level_2;
-    - City, Town or Community for locality;
-    - Neighborhood, Sector or Urbanization for district.
+    - admin_level_1:
+      state, province, region or equivalent;
+
+    - admin_level_2:
+      municipality, county, department or equivalent;
+
+    - locality:
+      city, town, village or community;
+
+    - district:
+      neighborhood, sector, parish or urbanization.
     """
 
     country_code: CountryCode
@@ -89,49 +94,51 @@ class DeclaredLocation(HCPModel):
 
     district: NonEmptyString | None = None
 
-    @field_validator("country_code", mode="before")
+    @field_validator(
+        "country_code",
+        mode="before",
+    )
     @classmethod
     def normalize_country_code(
         cls,
         value: object,
     ) -> object:
         """
-        Normalize country codes to uppercase before pattern validation.
+        Normalize country codes to uppercase before validation.
         """
         if isinstance(value, str):
             return value.strip().upper()
 
         return value
 
-    @model_validator(mode="after")
-    def normalize_optional_levels(
-        self,
-    ) -> "DeclaredLocation":
+    @field_validator(
+        "admin_level_2",
+        "district",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_location_value(
+        cls,
+        value: object,
+    ) -> object:
         """
-        Convert empty optional geographic levels into None.
-
-        Pydantic strips surrounding whitespace before this validator runs,
-        but compatible clients may still send empty strings.
+        Convert empty optional geographic values into None.
         """
-        if self.admin_level_2 == "":
-            self.admin_level_2 = None
+        if isinstance(value, str):
+            normalized_value = value.strip()
 
-        if self.district == "":
-            self.district = None
+            return normalized_value or None
 
-        return self
+        return value
 
     def to_display_text(
         self,
     ) -> str:
         """
-        Build a readable location label from the most specific level upward.
+        Build a readable location from the most specific level upward.
 
-        This method is intended for local presentation and compatibility
-        during the transition from schema version 0.5.
-
-        The country remains represented by its ISO code because localization
-        belongs to the consuming client, not to the canonical protocol.
+        Country remains represented by its ISO code because localization
+        belongs to the consuming client, not to the HCP contract.
         """
         parts = [
             self.district,
@@ -151,15 +158,15 @@ class DeclaredLocation(HCPModel):
         self,
     ) -> tuple[str, ...]:
         """
-        Return normalized hierarchical values for future spatial comparison.
+        Return normalized geographic values from broadest to most specific.
 
-        The order is broadest to most specific:
+        Order:
 
-        country → first administrative level → second administrative level
-        → locality → district.
-
-        These tokens are useful for deterministic filtering and later
-        PostgreSQL indexing, but they do not calculate geographic distance.
+        country
+        → first administrative level
+        → second administrative level
+        → locality
+        → district
         """
         values = [
             self.country_code,
@@ -180,7 +187,7 @@ class DeclaredLocation(HCPModel):
         value: str,
     ) -> str:
         """
-        Normalize a geographic value for deterministic internal comparison.
+        Normalize one geographic value for deterministic comparison.
         """
         return " ".join(
             value.casefold().split()
@@ -229,20 +236,15 @@ class Subject(HCPModel):
 
 class Observation(HCPModel):
     """
-    Humanitarian evidence observed at one specific moment in time.
-
-    The Observation describes:
-
-    - what was observed;
-    - who reported it;
-    - when it was observed;
-    - the geographic context voluntarily declared for that observation;
-    - an optional public contact.
+    Humanitarian evidence observed at one specific moment.
 
     Schema version 0.6 uses declared_location.
 
-    reported_location remains temporarily available only to load and
-    process legacy schema version 0.5 records during migration.
+    reported_location remains temporarily available for compatibility with
+    schema version 0.5 records and existing clients.
+
+    Location requirements are validated by HumanitarianRecord because they
+    depend on schema_version.
     """
 
     event_type: CanonicalToken
@@ -252,9 +254,8 @@ class Observation(HCPModel):
     reported_location: NonEmptyString | None = Field(
         default=None,
         description=(
-            "Legacy free-text location used by schema version 0.5."
+            "Legacy free-text geographic context used by schema version 0.5."
         ),
-        deprecated=True,
     )
 
     reported_by: CanonicalToken
@@ -293,7 +294,7 @@ class Observation(HCPModel):
         value: datetime,
     ) -> str:
         """
-        Serialize the canonical timestamp in UTC using the RFC 3339 Z suffix.
+        Serialize timestamps in UTC using the RFC 3339 Z suffix.
         """
         return (
             value
@@ -305,38 +306,14 @@ class Observation(HCPModel):
             )
         )
 
-    @model_validator(mode="after")
-    def require_location_context(
-        self,
-    ) -> "Observation":
-        """
-        Require structured or legacy geographic context.
-
-        During the migration period:
-
-        - new 0.6 records provide declared_location;
-        - legacy 0.5 records may provide reported_location.
-
-        The HumanitarianRecord validator applies the version-specific rule.
-        """
-        if (
-            self.declared_location is None
-            and self.reported_location is None
-        ):
-            raise ValueError(
-                "observation must include declared_location or the legacy "
-                "reported_location"
-            )
-
-        return self
-
     def location_display_text(
         self,
     ) -> str | None:
         """
-        Return a readable location for presentation and legacy services.
+        Return a readable geographic label.
 
-        Structured location is always preferred.
+        Structured location is preferred when available. Legacy free text is
+        returned for schema version 0.5 records.
         """
         if self.declared_location is not None:
             return (
@@ -351,19 +328,20 @@ class HumanitarianRecord(HCPModel):
     """
     Canonical representation of one Humanitarian Observation.
 
-    The record identifier identifies this record only. It never identifies
-    the human or animal described by the Subject.
+    The record UUID identifies this record only. It never identifies the
+    human or animal described by the Subject.
 
     Version transition:
 
     - schema 0.5:
-      accepts the legacy observation.reported_location string;
+      remains compatible with existing clients and records;
+      location may be absent or represented by reported_location;
 
     - schema 0.6:
       requires observation.declared_location.
 
-    Supporting both versions allows existing JSON records to remain readable
-    while the Web, Telegram client and storage layer migrate progressively.
+    The default remains 0.5 during migration so existing records and clients
+    continue working until Web, Telegram and storage are updated.
     """
 
     id: UUID
@@ -371,7 +349,7 @@ class HumanitarianRecord(HCPModel):
     schema_version: Literal[
         "0.5",
         "0.6",
-    ] = "0.6"
+    ] = "0.5"
 
     source_client: NonEmptyString
 
@@ -384,7 +362,14 @@ class HumanitarianRecord(HCPModel):
         self,
     ) -> "HumanitarianRecord":
         """
-        Enforce the location contract associated with each schema version.
+        Enforce the structured location requirement for schema 0.6.
+
+        Migration rules:
+
+        - 0.5 may use reported_location;
+        - 0.5 may use declared_location as a compatible extension;
+        - 0.5 may omit location;
+        - 0.6 requires declared_location.
         """
         if (
             self.schema_version == "0.6"
@@ -393,16 +378,6 @@ class HumanitarianRecord(HCPModel):
             raise ValueError(
                 "schema_version 0.6 requires "
                 "observation.declared_location"
-            )
-
-        if (
-            self.schema_version == "0.5"
-            and self.observation.reported_location is None
-            and self.observation.declared_location is None
-        ):
-            raise ValueError(
-                "schema_version 0.5 requires observation.reported_location "
-                "or a compatible declared_location extension"
             )
 
         return self
