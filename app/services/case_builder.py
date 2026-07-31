@@ -21,29 +21,22 @@ from app.models.query import HumanitarianQuery
 
 class HumanitarianCaseBuilder:
     """
-    Build a local Humanitarian Case from correlated Humanitarian Records.
+    Build one local Humanitarian Case from correlated Humanitarian Records.
 
-    A Humanitarian Case is a probable history assembled from compatible
-    reports. It is not a confirmed identity and does not replace the
-    original Humanitarian Records.
+    Public clients may present the resulting object as:
 
-    The builder organizes the result around:
+    - Caso relacionado;
+    - Historia del caso;
+    - Reportes del caso.
+
+    The builder organizes the interpretation around:
 
     1. space;
     2. time;
     3. description.
 
-    It preserves all related reports and presents the most recent report as
-    the current known situation.
-
-    This service does not:
-
-    - confirm identity;
-    - modify or merge source records;
-    - hide spatial or temporal conflicts;
-    - infer why a person or animal moved;
-    - persist the resulting case;
-    - synchronize the case between HCP Nodes.
+    It preserves traceability to every original Humanitarian Record and does
+    not establish identity.
     """
 
     def build(
@@ -53,22 +46,15 @@ class HumanitarianCaseBuilder:
         records: list[HumanitarianRecord],
     ) -> HumanitarianCase:
         """
-        Build one local Humanitarian Case.
+        Build one probable case history.
 
-        The strongest result determines the displayed compatibility score.
+        The strongest correlation result provides the displayed compatibility.
 
-        The latest related record determines the current situation because
-        event types may describe successive moments of one humanitarian
-        history, for example:
-
-        missing
-        → hospitalized
-        → sheltered
-        → safe.
+        The most recent related record provides the current situation.
 
         Raises:
             CorrelationProcessingError:
-                If the supplied results and records are inconsistent.
+                If no results exist or the supplied records are inconsistent.
         """
         if not results:
             raise CorrelationProcessingError(
@@ -127,12 +113,6 @@ class HumanitarianCaseBuilder:
                 },
             )
 
-            reasoning = self._build_reasoning(
-                results=ordered_results,
-                strongest_record=strongest_record,
-                latest_record=latest_record,
-            )
-
             return HumanitarianCase(
                 source_query_id=self._source_query_id(
                     query
@@ -144,22 +124,8 @@ class HumanitarianCaseBuilder:
                     strongest_result=strongest_result,
                     latest_record=latest_record,
                 ),
-                current_situation=CurrentSituation(
-                    likely_event_type=(
-                        latest_record
-                        .observation
-                        .event_type
-                    ),
-                    reported_location=(
-                        latest_record
-                        .observation
-                        .location_display_text()
-                    ),
-                    observed_at=(
-                        latest_record
-                        .observation
-                        .observed_at
-                    ),
+                current_situation=self._build_current_situation(
+                    latest_record
                 ),
                 correlation=CaseCorrelation(
                     score=strongest_result.score,
@@ -174,7 +140,11 @@ class HumanitarianCaseBuilder:
                     conflicting_evidence=(
                         conflicting_evidence
                     ),
-                    reasoning=reasoning,
+                    reasoning=self._build_reasoning(
+                        results=ordered_results,
+                        strongest_record=strongest_record,
+                        latest_record=latest_record,
+                    ),
                 ),
                 related_records=related_records,
                 humanitarian_timeline=timeline,
@@ -182,7 +152,7 @@ class HumanitarianCaseBuilder:
                     status="unverified",
                     message=(
                         "This Humanitarian Case is a local probabilistic "
-                        "interpretation built from space, time and "
+                        "interpretation built from spatial, temporal and "
                         "descriptive compatibility. It does not establish "
                         "identity and requires human verification."
                     ),
@@ -202,11 +172,7 @@ class HumanitarianCaseBuilder:
         results: list[CorrelationResult],
     ) -> list[CorrelationResult]:
         """
-        Order correlation results from strongest to weakest.
-
-        HumanitarianCase currently receives the final score and confidence
-        produced by CorrelationService. Chronological ordering is handled
-        separately by the timeline builder.
+        Order results by compatibility and evidence strength.
         """
         return sorted(
             results,
@@ -281,9 +247,6 @@ class HumanitarianCaseBuilder:
     ) -> HumanitarianRecord:
         """
         Return the most recent correlated Humanitarian Record.
-
-        Event type is used only to describe the most recent known report.
-        It does not participate as identity evidence.
         """
         related_records = [
             records_by_id[result.record_id]
@@ -303,6 +266,38 @@ class HumanitarianCaseBuilder:
         )
 
     @staticmethod
+    def _build_current_situation(
+        latest_record: HumanitarianRecord,
+    ) -> CurrentSituation:
+        """
+        Build the current known situation from the latest related report.
+
+        Structured location is preserved directly. Legacy free text remains
+        available for schema 0.5 clients.
+        """
+        observation = (
+            latest_record.observation
+        )
+
+        return CurrentSituation(
+            likely_event_type=(
+                observation.event_type
+            ),
+            declared_location=(
+                observation.declared_location
+            ),
+            reported_location=(
+                observation.reported_location
+            ),
+            observed_at=(
+                observation.observed_at
+            ),
+            source_record_id=(
+                latest_record.id
+            ),
+        )
+
+    @staticmethod
     def _build_related_records(
         results: list[CorrelationResult],
         records_by_id: dict[
@@ -311,32 +306,55 @@ class HumanitarianCaseBuilder:
         ],
     ) -> list[RelatedRecord]:
         """
-        Build references to the reports participating in the case.
+        Build compact references to reports included in the case.
 
-        Related records remain ordered by compatibility. The timeline provides
-        the chronological history.
+        Each reference carries enough information for a public client to show:
+
+        - event;
+        - location;
+        - time;
+        - whether a public contact exists;
+        - the record identifier needed to open the full report.
         """
-        return [
-            RelatedRecord(
-                record_id=result.record_id,
-                event_type=(
-                    records_by_id[
-                        result.record_id
-                    ].observation.event_type
-                ),
-                observed_at=(
-                    records_by_id[
-                        result.record_id
-                    ].observation.observed_at
-                ),
-                source=(
-                    records_by_id[
-                        result.record_id
-                    ].source_client
-                ),
+        related_records: list[
+            RelatedRecord
+        ] = []
+
+        for result in results:
+            record = records_by_id[
+                result.record_id
+            ]
+
+            observation = (
+                record.observation
             )
-            for result in results
-        ]
+
+            related_records.append(
+                RelatedRecord(
+                    record_id=record.id,
+                    event_type=(
+                        observation.event_type
+                    ),
+                    observed_at=(
+                        observation.observed_at
+                    ),
+                    declared_location=(
+                        observation.declared_location
+                    ),
+                    reported_location=(
+                        observation.reported_location
+                    ),
+                    source=(
+                        record.source_client
+                    ),
+                    public_contact_available=(
+                        observation.public_contact
+                        is not None
+                    ),
+                )
+            )
+
+        return related_records
 
     @staticmethod
     def _build_timeline(
@@ -347,43 +365,51 @@ class HumanitarianCaseBuilder:
         ],
     ) -> list[TimelineEntry]:
         """
-        Build the chronological history of the related case.
-
-        During the 0.5 to 0.6 transition, TimelineEntry still exposes
-        reported_location as display text. Structured DeclaredLocation remains
-        stored in the original Humanitarian Record and will be added directly
-        to the HumanitarianCase model in the next step.
+        Build the chronological history of reports included in the case.
         """
-        timeline = [
-            TimelineEntry(
-                record_id=result.record_id,
-                event_type=(
-                    records_by_id[
-                        result.record_id
-                    ].observation.event_type
-                ),
-                observed_at=(
-                    records_by_id[
-                        result.record_id
-                    ].observation.observed_at
-                ),
-                reported_location=(
-                    records_by_id[
-                        result.record_id
-                    ]
-                    .observation
-                    .location_display_text()
-                ),
-                description=(
-                    "Humanitarian report contributed by "
-                    f"{records_by_id[result.record_id].source_client}."
-                ),
+        timeline: list[
+            TimelineEntry
+        ] = []
+
+        for result in results:
+            record = records_by_id[
+                result.record_id
+            ]
+
+            observation = (
+                record.observation
             )
-            for result in results
-        ]
+
+            timeline.append(
+                TimelineEntry(
+                    record_id=record.id,
+                    event_type=(
+                        observation.event_type
+                    ),
+                    observed_at=(
+                        observation.observed_at
+                    ),
+                    declared_location=(
+                        observation.declared_location
+                    ),
+                    reported_location=(
+                        observation.reported_location
+                    ),
+                    description=(
+                        "Humanitarian report contributed by "
+                        f"{record.source_client}."
+                    ),
+                    public_contact_available=(
+                        observation.public_contact
+                        is not None
+                    ),
+                )
+            )
 
         timeline.sort(
-            key=lambda entry: entry.observed_at
+            key=lambda entry: (
+                entry.observed_at
+            )
         )
 
         return timeline
@@ -398,16 +424,19 @@ class HumanitarianCaseBuilder:
         """
         Convert correlation signals into case-level evidence.
 
-        Evidence remains traceable to the original Humanitarian Record.
-
-        NOT_AVAILABLE signals are not included as conflicts because absence of
-        information is not a contradiction.
+        NOT_AVAILABLE signals are excluded because missing information is not
+        a contradiction.
         """
-        evidence: list[EvidenceItem] = []
+        evidence: list[
+            EvidenceItem
+        ] = []
 
         for result in results:
             for signal in result.signals:
-                if signal.status not in status_group:
+                if (
+                    signal.status
+                    not in status_group
+                ):
                     continue
 
                 evidence.append(
@@ -454,16 +483,7 @@ class HumanitarianCaseBuilder:
         latest_record: HumanitarianRecord,
     ) -> str:
         """
-        Explain how the case was constructed.
-
-        The explanation separates:
-
-        - spatial evidence;
-        - temporal evidence;
-        - descriptive evidence;
-        - conflicts;
-        - missing information;
-        - the latest known report.
+        Explain how the probable case history was built.
         """
         strongest_result = results[0]
 
@@ -471,8 +491,10 @@ class HumanitarianCaseBuilder:
             results
         )
 
-        evidence_groups = cls._count_evidence_groups(
-            strongest_result.signals
+        evidence_groups = (
+            cls._count_evidence_groups(
+                strongest_result.signals
+            )
         )
 
         strongest_location = (
@@ -501,14 +523,15 @@ class HumanitarianCaseBuilder:
             )
         )
 
-        unavailable_context = (
-            f" {signal_counts['unavailable']} requested evidence "
-            f"field"
-            f"{'' if signal_counts['unavailable'] == 1 else 's'} "
-            "were unavailable in the related reports."
-            if signal_counts["unavailable"] > 0
-            else ""
-        )
+        unavailable_context = ""
+
+        if signal_counts["unavailable"] > 0:
+            unavailable_context = (
+                f" {signal_counts['unavailable']} requested evidence "
+                f"field"
+                f"{'' if signal_counts['unavailable'] == 1 else 's'} "
+                "were unavailable in the related reports."
+            )
 
         return (
             f"The case was built from {len(results)} related Humanitarian "
@@ -522,7 +545,7 @@ class HumanitarianCaseBuilder:
             f"{evidence_groups['time']} temporal and "
             f"{evidence_groups['description']} descriptive signal"
             f"{'' if evidence_groups['description'] == 1 else 's'}. "
-            f"Across the related reports there are "
+            f"Across all related reports there are "
             f"{signal_counts['supporting']} supporting signal"
             f"{'' if signal_counts['supporting'] == 1 else 's'} and "
             f"{signal_counts['conflicting']} conflicting signal"
@@ -530,25 +553,25 @@ class HumanitarianCaseBuilder:
             f"{unavailable_context} "
             f"{location_context} "
             f"{event_context} "
-            "The case expresses probable continuity between reports and "
+            "This probable history expresses continuity between reports and "
             "does not establish identity."
         )
 
-    @classmethod
+    @staticmethod
     def _build_summary(
-        cls,
         result_count: int,
         strongest_result: CorrelationResult,
         latest_record: HumanitarianRecord,
     ) -> str:
         """
-        Build a concise summary focused on the latest useful information.
-
-        The frontend will later present this as a public 'Caso relacionado'.
+        Build a concise summary centered on the latest useful report.
         """
+        observation = (
+            latest_record.observation
+        )
+
         latest_location = (
-            latest_record
-            .observation
+            observation
             .location_display_text()
         )
 
@@ -564,9 +587,9 @@ class HumanitarianCaseBuilder:
             f"The strongest report has a compatibility score of "
             f"{strongest_result.score:.2f}. "
             f"The latest known report describes "
-            f"'{latest_record.observation.event_type}'"
+            f"'{observation.event_type}'"
             f"{location_text} at "
-            f"{latest_record.observation.observed_at.isoformat()}. "
+            f"{observation.observed_at.isoformat()}. "
             "This probable case history requires human verification."
         )
 
@@ -612,7 +635,7 @@ class HumanitarianCaseBuilder:
         signals: list[CorrelationSignal],
     ) -> dict[str, int]:
         """
-        Count evidence signals by the three HCP correlation groups.
+        Count signals by the three HCP correlation groups.
         """
         space = 0
         time = 0
@@ -625,7 +648,10 @@ class HumanitarianCaseBuilder:
             }:
                 space += 1
 
-            elif signal.field == "observation.search_time":
+            elif (
+                signal.field
+                == "observation.search_time"
+            ):
                 time += 1
 
             elif signal.field.startswith(
@@ -645,20 +671,22 @@ class HumanitarianCaseBuilder:
         latest_location: str | None,
     ) -> str:
         """
-        Explain the geographic context without claiming physical presence.
+        Explain geographic context without claiming verified presence.
         """
         if (
             strongest_location is None
             and latest_location is None
         ):
             return (
-                "No comparable geographic context was available for the "
-                "case summary."
+                "No comparable declared geographic context was available."
             )
 
-        if strongest_location == latest_location:
+        if (
+            strongest_location
+            == latest_location
+        ):
             return (
-                f"The strongest and latest reports refer to the declared "
+                "The strongest and latest reports refer to the declared "
                 f"location '{latest_location}'."
             )
 
@@ -669,7 +697,7 @@ class HumanitarianCaseBuilder:
             return (
                 f"The strongest report refers to '{strongest_location}', "
                 f"while the latest report refers to '{latest_location}'. "
-                "This geographic variation remains visible for human review."
+                "The geographic variation remains visible for human review."
             )
 
         available_location = (
@@ -678,7 +706,7 @@ class HumanitarianCaseBuilder:
         )
 
         return (
-            f"The available declared geographic context is "
+            "The available declared geographic context is "
             f"'{available_location}'."
         )
 
@@ -688,9 +716,7 @@ class HumanitarianCaseBuilder:
         latest_record: HumanitarianRecord,
     ) -> str:
         """
-        Explain that event types form context and chronology.
-
-        Event types do not support or contradict identity compatibility.
+        Explain event types as situational and chronological context.
         """
         strongest_event = (
             strongest_record
@@ -704,18 +730,21 @@ class HumanitarianCaseBuilder:
             .event_type
         )
 
-        if strongest_event == latest_event:
+        if (
+            strongest_event
+            == latest_event
+        ):
             return (
-                f"The latest related report describes the situation "
+                "The latest related report describes the situation "
                 f"'{latest_event}'. Event type is used only as humanitarian "
                 "context."
             )
 
         return (
-            f"The strongest descriptive report describes "
-            f"'{strongest_event}', while the latest related report describes "
-            f"'{latest_event}'. Different event types may represent different "
-            "moments in the same probable case history."
+            "The strongest descriptive report describes "
+            f"'{strongest_event}', while the latest report describes "
+            f"'{latest_event}'. Different event types may represent "
+            "different moments of the same probable case history."
         )
 
     @staticmethod
