@@ -1,5 +1,7 @@
 import unicodedata
+from datetime import datetime
 from difflib import SequenceMatcher
+from typing import Callable
 
 from app.core.errors import CorrelationProcessingError
 from app.models.correlation import (
@@ -8,89 +10,96 @@ from app.models.correlation import (
     CorrelationSignalStatus,
     confidence_from_score,
 )
-from app.models.humanitarian_record import HumanitarianRecord
+from app.models.humanitarian_record import (
+    DeclaredLocation,
+    HumanitarianRecord,
+)
 from app.models.query import HumanitarianQuery
 
 
 class CorrelationService:
     """
-    Application service for explainable local correlation.
+    Build an explainable compatibility assessment between one search context
+    and one Humanitarian Record.
 
-    Correlation answers two different questions:
+    HCP correlation is based on three groups of evidence:
 
-    1. Compatibility:
-       How similar is the evidence that was actually compared?
+    1. Space
+       Geographic context declared by the reporting person and by the person
+       performing the search.
 
-    2. Evidence strength:
-       How much independent evidence supports that compatibility?
+    2. Time
+       The moment of the report, the moment of the search and the elapsed time
+       available for a plausible displacement.
 
-    These concepts must remain separate.
+    3. Description
+       Name, estimated age, recognition features and animal-specific data.
 
-    For example:
+    The service does not:
 
-    - exact name + exact age:
-      high compatibility, but moderate evidence strength;
-
-    - exact name + age + recognition features + animal attributes:
-      high compatibility and high evidence strength.
-
-    Correlation does not:
-
-    - verify identity;
-    - interpret the cause of geographic distance;
-    - exclude records merely because event types differ;
+    - confirm identity;
+    - treat event type as identity evidence;
     - create Humanitarian Cases;
-    - modify Humanitarian Records;
-    - persist results.
+    - infer why a person or animal moved;
+    - use the reporter type as compatibility evidence;
+    - permanently discard a distant report merely because it belongs to
+      another country.
 
-    Event type describes what was observed. It is not identity evidence.
-
-    A missing, hospitalized, sheltered or safe observation may represent
-    a different moment of the same humanitarian case.
+    A high score means that the compared information is compatible. It does
+    not mean that identity has been established.
     """
 
     # ------------------------------------------------------------------
     # Human evidence weights
     # ------------------------------------------------------------------
 
-    HUMAN_REPORTED_LABEL_WEIGHT = 30.0
-    HUMAN_ESTIMATED_AGE_WEIGHT = 20.0
-    HUMAN_RECOGNITION_FEATURES_WEIGHT = 40.0
-    HUMAN_REPORTED_LOCATION_WEIGHT = 10.0
+    HUMAN_SPATIAL_WEIGHT = 30.0
+    HUMAN_TEMPORAL_WEIGHT = 15.0
+    HUMAN_NAME_WEIGHT = 20.0
+    HUMAN_AGE_WEIGHT = 10.0
+    HUMAN_FEATURES_WEIGHT = 25.0
 
     # ------------------------------------------------------------------
     # Animal evidence weights
     # ------------------------------------------------------------------
 
-    ANIMAL_REPORTED_LABEL_WEIGHT = 20.0
-    ANIMAL_SPECIES_WEIGHT = 15.0
-    ANIMAL_BREED_WEIGHT = 10.0
-    ANIMAL_SIZE_WEIGHT = 10.0
-    ANIMAL_RECOGNITION_FEATURES_WEIGHT = 35.0
-    ANIMAL_REPORTED_LOCATION_WEIGHT = 10.0
+    ANIMAL_SPATIAL_WEIGHT = 30.0
+    ANIMAL_TEMPORAL_WEIGHT = 15.0
+    ANIMAL_NAME_WEIGHT = 15.0
+    ANIMAL_SPECIES_WEIGHT = 10.0
+    ANIMAL_BREED_WEIGHT = 5.0
+    ANIMAL_SIZE_WEIGHT = 5.0
+    ANIMAL_FEATURES_WEIGHT = 20.0
 
     # ------------------------------------------------------------------
-    # Similarity thresholds
+    # Text thresholds
     # ------------------------------------------------------------------
 
     NAME_MATCH_THRESHOLD = 0.85
-    NAME_PARTIAL_THRESHOLD = 0.50
+    NAME_PARTIAL_THRESHOLD = 0.48
 
-    FEATURES_MATCH_THRESHOLD = 0.75
-    FEATURES_PARTIAL_THRESHOLD = 0.25
-
-    LOCATION_MATCH_THRESHOLD = 0.80
-    LOCATION_PARTIAL_THRESHOLD = 0.30
+    FEATURES_MATCH_THRESHOLD = 0.76
+    FEATURES_PARTIAL_THRESHOLD = 0.24
 
     ANIMAL_TEXT_MATCH_THRESHOLD = 0.85
-    ANIMAL_TEXT_PARTIAL_THRESHOLD = 0.45
+    ANIMAL_TEXT_PARTIAL_THRESHOLD = 0.42
+
+    LEGACY_LOCATION_MATCH_THRESHOLD = 0.80
+    LEGACY_LOCATION_PARTIAL_THRESHOLD = 0.30
 
     # ------------------------------------------------------------------
     # Age rules
     # ------------------------------------------------------------------
 
     STRONG_AGE_TOLERANCE = 3
-    BROAD_AGE_TOLERANCE = 7
+    BROAD_AGE_TOLERANCE = 10
+
+    # ------------------------------------------------------------------
+    # Space-time rules
+    # ------------------------------------------------------------------
+
+    DISTANT_COUNTRY_REVIEW_AFTER_DAYS = 7
+    DISTANT_COUNTRY_BROAD_AFTER_DAYS = 30
 
     def correlate_records(
         self,
@@ -102,13 +111,14 @@ class CorrelationService:
         """
         Correlate one Query against candidate Humanitarian Records.
 
-        Only records with the same subject type participate.
+        SearchService decides which records deserve comparison.
+        CorrelationService explains how compatible each candidate is.
 
-        The returned score represents compatibility among evidence that was
-        actually available and compared.
+        Results are ordered by:
 
-        Confidence represents evidence strength and therefore also considers
-        how much independent evidence was supplied.
+        1. final compatibility score;
+        2. evidence strength;
+        3. recency of the source record.
         """
         if limit is not None and limit < 1:
             raise CorrelationProcessingError(
@@ -121,30 +131,43 @@ class CorrelationService:
             )
 
         try:
-            results = [
-                self.correlate_record(
-                    query=query,
-                    record=record,
+            assessed_results = [
+                (
+                    self.correlate_record(
+                        query=query,
+                        record=record,
+                    ),
+                    record,
                 )
                 for record in records
                 if record.subject.type == query.subject.type
             ]
 
             filtered_results = [
-                result
-                for result in results
+                (result, record)
+                for result, record in assessed_results
                 if result.score >= minimum_score
             ]
 
             filtered_results.sort(
-                key=lambda result: result.score,
-                reverse=True,
+                key=lambda item: (
+                    -item[0].score,
+                    -self._confidence_sort_value(
+                        item[0].confidence.value
+                    ),
+                    -item[1].observation.observed_at.timestamp(),
+                )
             )
 
-            if limit is not None:
-                return filtered_results[:limit]
+            results = [
+                result
+                for result, _record in filtered_results
+            ]
 
-            return filtered_results
+            if limit is not None:
+                return results[:limit]
+
+            return results
 
         except CorrelationProcessingError:
             raise
@@ -160,15 +183,19 @@ class CorrelationService:
         record: HumanitarianRecord,
     ) -> CorrelationResult:
         """
-        Correlate one Query with one Humanitarian Record.
+        Correlate one search context with one Humanitarian Record.
 
-        Important rules:
+        Only information supplied by the Query participates.
 
-        - only evidence supplied by the Query participates;
-        - unavailable record evidence does not count as a conflict;
-        - event type does not participate in identity compatibility;
-        - location has a low contextual weight;
-        - descriptive evidence carries most of the correlation value.
+        Missing evidence is reported as NOT_AVAILABLE. It does not become a
+        contradiction and is excluded from the compatibility denominator.
+
+        The evidence level is calculated independently from compatibility.
+        Therefore:
+
+        - exact name alone can have high compatibility but low evidence;
+        - matching space, time, name, age and characteristics can have both
+          high compatibility and high evidence.
         """
         if query.subject.type != record.subject.type:
             raise CorrelationProcessingError(
@@ -177,25 +204,50 @@ class CorrelationService:
 
         signals: list[CorrelationSignal] = []
 
+        self._append_spatial_signal(
+            signals=signals,
+            query=query,
+            record=record,
+        )
+
+        self._append_temporal_signal(
+            signals=signals,
+            query=query,
+            record=record,
+        )
+
+        self._append_name_signal(
+            signals=signals,
+            query_value=query.subject.reported_label,
+            record_value=record.subject.reported_label,
+            weight=self._name_weight(
+                query.subject.type
+            ),
+        )
+
         if query.subject.type == "human":
-            self._append_human_signals(
+            self._append_age_signal(
                 signals=signals,
-                query=query,
-                record=record,
+                query_age=query.subject.estimated_age,
+                record_age=record.subject.estimated_age,
+                weight=self.HUMAN_AGE_WEIGHT,
             )
 
-        else:
+        self._append_features_signal(
+            signals=signals,
+            query_value=query.subject.recognition_features,
+            record_value=record.subject.recognition_features,
+            weight=self._features_weight(
+                query.subject.type
+            ),
+        )
+
+        if query.subject.type == "animal":
             self._append_animal_signals(
                 signals=signals,
                 query=query,
                 record=record,
             )
-
-        self._append_location_signal(
-            signals=signals,
-            query=query,
-            record=record,
-        )
 
         compatibility_score = (
             self._calculate_compatibility_score(
@@ -204,7 +256,7 @@ class CorrelationService:
             )
         )
 
-        evidence_strength_score = (
+        evidence_strength = (
             self._calculate_evidence_strength(
                 signals=signals,
                 subject_type=query.subject.type,
@@ -216,164 +268,480 @@ class CorrelationService:
             subject_type=record.subject.type,
             score=compatibility_score,
             confidence=confidence_from_score(
-                evidence_strength_score
+                evidence_strength
             ),
             signals=signals,
         )
 
     # ------------------------------------------------------------------
-    # Signal construction
+    # Spatial evidence
     # ------------------------------------------------------------------
 
-    def _append_human_signals(
+    def _append_spatial_signal(
         self,
         signals: list[CorrelationSignal],
         query: HumanitarianQuery,
         record: HumanitarianRecord,
     ) -> None:
         """
-        Append descriptive evidence for a human subject.
+        Compare declared geographic context.
+
+        Structured location is preferred.
+
+        The hierarchy is interpreted as:
+
+        country
+        → admin_level_1
+        → admin_level_2
+        → locality
+        → district
+
+        A different country is a strong spatial difference, but it is not a
+        permanent exclusion. Elapsed time is considered so distant reports
+        can remain visible for later human review.
         """
-        self._append_name_signal(
-            signals=signals,
-            query_value=query.subject.reported_label,
-            record_value=record.subject.reported_label,
-            weight=self.HUMAN_REPORTED_LABEL_WEIGHT,
+        query_location = query.declared_location()
+
+        record_location = (
+            record.observation.declared_location
         )
 
-        self._append_age_signal(
-            signals=signals,
-            query_age=query.subject.estimated_age,
-            record_age=record.subject.estimated_age,
-            weight=self.HUMAN_ESTIMATED_AGE_WEIGHT,
+        weight = self._spatial_weight(
+            query.subject.type
         )
 
-        self._append_features_signal(
-            signals=signals,
-            query_value=query.subject.recognition_features,
-            record_value=record.subject.recognition_features,
-            weight=self.HUMAN_RECOGNITION_FEATURES_WEIGHT,
-        )
+        if (
+            query_location is not None
+            and record_location is not None
+        ):
+            self._append_structured_spatial_signal(
+                signals=signals,
+                query_location=query_location,
+                record_location=record_location,
+                searched_at=query.searched_at(),
+                observed_at=record.observation.observed_at,
+                weight=weight,
+            )
 
-    def _append_animal_signals(
-        self,
-        signals: list[CorrelationSignal],
-        query: HumanitarianQuery,
-        record: HumanitarianRecord,
-    ) -> None:
-        """
-        Append descriptive evidence for an animal subject.
-        """
-        self._append_name_signal(
-            signals=signals,
-            query_value=query.subject.reported_label,
-            record_value=record.subject.reported_label,
-            weight=self.ANIMAL_REPORTED_LABEL_WEIGHT,
-        )
-
-        self._append_animal_text_signal(
-            signals=signals,
-            field="subject.species",
-            query_value=getattr(
-                query.subject,
-                "species",
-                None,
-            ),
-            record_value=getattr(
-                record.subject,
-                "species",
-                None,
-            ),
-            weight=self.ANIMAL_SPECIES_WEIGHT,
-            description="species",
-        )
-
-        self._append_animal_text_signal(
-            signals=signals,
-            field="subject.breed",
-            query_value=getattr(
-                query.subject,
-                "breed",
-                None,
-            ),
-            record_value=getattr(
-                record.subject,
-                "breed",
-                None,
-            ),
-            weight=self.ANIMAL_BREED_WEIGHT,
-            description="breed",
-        )
-
-        self._append_exact_signal(
-            signals=signals,
-            field="subject.size",
-            query_value=getattr(
-                query.subject,
-                "size",
-                None,
-            ),
-            record_value=getattr(
-                record.subject,
-                "size",
-                None,
-            ),
-            weight=self.ANIMAL_SIZE_WEIGHT,
-            description="animal size",
-        )
-
-        self._append_features_signal(
-            signals=signals,
-            query_value=query.subject.recognition_features,
-            record_value=record.subject.recognition_features,
-            weight=self.ANIMAL_RECOGNITION_FEATURES_WEIGHT,
-        )
-
-    def _append_location_signal(
-        self,
-        signals: list[CorrelationSignal],
-        query: HumanitarianQuery,
-        record: HumanitarianRecord,
-    ) -> None:
-        """
-        Append free-text location as contextual evidence.
-
-        Location is deliberately weak in schema version 0.5 because it is
-        currently an unstructured user-entered string.
-
-        A different location can lower compatibility slightly, but it cannot
-        override strong name, age or recognition-feature evidence.
-
-        Future versions may replace this with structured country, region,
-        locality and space-time plausibility rules.
-        """
-        if query.observation is None:
             return
 
-        query_location = (
+        query_legacy_location = (
             query.observation.reported_location
+            if query.observation is not None
+            else None
         )
 
-        if query_location is None:
+        record_legacy_location = (
+            record.observation.reported_location
+        )
+
+        if query_legacy_location is None:
             return
 
-        location_weight = (
-            self.HUMAN_REPORTED_LOCATION_WEIGHT
-            if query.subject.type == "human"
-            else self.ANIMAL_REPORTED_LOCATION_WEIGHT
+        if record_legacy_location is None:
+            signals.append(
+                CorrelationSignal(
+                    field="observation.declared_location",
+                    status=CorrelationSignalStatus.NOT_AVAILABLE,
+                    contribution=0.0,
+                    explanation=(
+                        "The candidate record does not contain geographic "
+                        "evidence that can be compared with the search."
+                    ),
+                    query_value=query_legacy_location,
+                    record_value=None,
+                )
+            )
+
+            return
+
+        similarity = self._descriptive_text_similarity(
+            query_legacy_location,
+            record_legacy_location,
         )
 
-        self._append_text_signal(
-            signals=signals,
-            field="observation.reported_location",
-            query_value=query_location,
-            record_value=record.observation.reported_location,
-            weight=location_weight,
-            description="reported location",
-            match_threshold=self.LOCATION_MATCH_THRESHOLD,
-            partial_threshold=self.LOCATION_PARTIAL_THRESHOLD,
-            similarity_function=self._descriptive_text_similarity,
+        status = self._similarity_status(
+            similarity=similarity,
+            match_threshold=(
+                self.LEGACY_LOCATION_MATCH_THRESHOLD
+            ),
+            partial_threshold=(
+                self.LEGACY_LOCATION_PARTIAL_THRESHOLD
+            ),
         )
+
+        contribution = (
+            self._contribution_for_similarity(
+                similarity=similarity,
+                status=status,
+                weight=weight,
+            )
+        )
+
+        signals.append(
+            CorrelationSignal(
+                field="observation.reported_location",
+                status=status,
+                contribution=contribution,
+                explanation=self._legacy_location_explanation(
+                    similarity=similarity,
+                    status=status,
+                ),
+                query_value=query_legacy_location,
+                record_value=record_legacy_location,
+            )
+        )
+
+    def _append_structured_spatial_signal(
+        self,
+        signals: list[CorrelationSignal],
+        query_location: DeclaredLocation,
+        record_location: DeclaredLocation,
+        searched_at: datetime | None,
+        observed_at: datetime,
+        weight: float,
+    ) -> None:
+        """
+        Build one explainable signal from the structured hierarchy.
+        """
+        comparison = self._compare_structured_locations(
+            query_location=query_location,
+            record_location=record_location,
+            searched_at=searched_at,
+            observed_at=observed_at,
+        )
+
+        contribution = (
+            self._contribution_for_similarity(
+                similarity=comparison.similarity,
+                status=comparison.status,
+                weight=weight,
+            )
+        )
+
+        signals.append(
+            CorrelationSignal(
+                field="observation.declared_location",
+                status=comparison.status,
+                contribution=contribution,
+                explanation=comparison.explanation,
+                query_value=(
+                    query_location.to_display_text()
+                ),
+                record_value=(
+                    record_location.to_display_text()
+                ),
+            )
+        )
+
+    def _compare_structured_locations(
+        self,
+        query_location: DeclaredLocation,
+        record_location: DeclaredLocation,
+        searched_at: datetime | None,
+        observed_at: datetime,
+    ) -> "SpatialComparison":
+        """
+        Compare location hierarchy without requiring coordinates.
+
+        Different-country compatibility is deliberately time-sensitive.
+
+        This first spatial model does not calculate kilometers. Future
+        versions may use local geographic datasets while preserving the same
+        DeclaredLocation contract.
+        """
+        if (
+            query_location.country_code
+            != record_location.country_code
+        ):
+            elapsed_days = self._elapsed_days(
+                searched_at=searched_at,
+                observed_at=observed_at,
+            )
+
+            if (
+                elapsed_days
+                >= self.DISTANT_COUNTRY_BROAD_AFTER_DAYS
+            ):
+                return SpatialComparison(
+                    status=(
+                        CorrelationSignalStatus.PARTIAL_MATCH
+                    ),
+                    similarity=0.45,
+                    explanation=(
+                        "The search and report refer to different countries, "
+                        f"but {self._format_days(elapsed_days)} have elapsed. "
+                        "The geographic difference is preserved as a distant "
+                        "case for human review rather than treated as a "
+                        "permanent exclusion."
+                    ),
+                )
+
+            if (
+                elapsed_days
+                >= self.DISTANT_COUNTRY_REVIEW_AFTER_DAYS
+            ):
+                return SpatialComparison(
+                    status=(
+                        CorrelationSignalStatus.PARTIAL_MATCH
+                    ),
+                    similarity=0.25,
+                    explanation=(
+                        "The search and report refer to different countries. "
+                        f"{self._format_days(elapsed_days)} have elapsed, so "
+                        "the report may remain available as a distant case "
+                        "for human review."
+                    ),
+                )
+
+            return SpatialComparison(
+                status=CorrelationSignalStatus.CONFLICT,
+                similarity=0.0,
+                explanation=(
+                    "The search and report refer to different countries and "
+                    "the elapsed time is short. The geographic contexts are "
+                    "not currently considered locally compatible."
+                ),
+            )
+
+        admin_level_1_similarity = (
+            self._location_level_similarity(
+                query_location.admin_level_1,
+                record_location.admin_level_1,
+            )
+        )
+
+        admin_level_2_similarity = (
+            self._optional_location_level_similarity(
+                query_location.admin_level_2,
+                record_location.admin_level_2,
+            )
+        )
+
+        locality_similarity = (
+            self._location_level_similarity(
+                query_location.locality,
+                record_location.locality,
+            )
+        )
+
+        district_similarity = (
+            self._optional_location_level_similarity(
+                query_location.district,
+                record_location.district,
+            )
+        )
+
+        if (
+            district_similarity is not None
+            and district_similarity >= 0.82
+            and locality_similarity >= 0.82
+        ):
+            return SpatialComparison(
+                status=CorrelationSignalStatus.MATCH,
+                similarity=1.0,
+                explanation=(
+                    "The declared locations are compatible at country, "
+                    "locality and district level."
+                ),
+            )
+
+        if locality_similarity >= 0.82:
+            return SpatialComparison(
+                status=CorrelationSignalStatus.MATCH,
+                similarity=0.90,
+                explanation=(
+                    "The declared locations are compatible in the same "
+                    "locality."
+                ),
+            )
+
+        if (
+            admin_level_2_similarity is not None
+            and admin_level_2_similarity >= 0.82
+        ):
+            return SpatialComparison(
+                status=(
+                    CorrelationSignalStatus.PARTIAL_MATCH
+                ),
+                similarity=0.76,
+                explanation=(
+                    "The declared locations are compatible at the second "
+                    "administrative level, but the locality or district is "
+                    "different or unavailable."
+                ),
+            )
+
+        if admin_level_1_similarity >= 0.82:
+            return SpatialComparison(
+                status=(
+                    CorrelationSignalStatus.PARTIAL_MATCH
+                ),
+                similarity=0.60,
+                explanation=(
+                    "The declared locations belong to the same first "
+                    "administrative region."
+                ),
+            )
+
+        return SpatialComparison(
+            status=CorrelationSignalStatus.PARTIAL_MATCH,
+            similarity=0.40,
+            explanation=(
+                "The declared locations belong to the same country but to "
+                "different or insufficiently similar regions."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Temporal evidence
+    # ------------------------------------------------------------------
+
+    def _append_temporal_signal(
+        self,
+        signals: list[CorrelationSignal],
+        query: HumanitarianQuery,
+        record: HumanitarianRecord,
+    ) -> None:
+        """
+        Compare the report time with the search time.
+
+        The search timestamp represents when the search context was declared.
+
+        Time is not interpreted alone. When countries differ, the spatial
+        signal already uses elapsed time to decide whether a distant report
+        should remain available for review.
+        """
+        searched_at = query.searched_at()
+
+        if searched_at is None:
+            return
+
+        observed_at = (
+            record.observation.observed_at
+        )
+
+        elapsed_seconds = (
+            searched_at - observed_at
+        ).total_seconds()
+
+        weight = self._temporal_weight(
+            query.subject.type
+        )
+
+        if elapsed_seconds < 0:
+            signals.append(
+                CorrelationSignal(
+                    field="observation.search_time",
+                    status=CorrelationSignalStatus.CONFLICT,
+                    contribution=0.0,
+                    explanation=(
+                        "The report timestamp occurs after the declared "
+                        "search timestamp, so the temporal sequence is not "
+                        "currently plausible."
+                    ),
+                    query_value=searched_at.isoformat(),
+                    record_value=observed_at.isoformat(),
+                )
+            )
+
+            return
+
+        elapsed_days = (
+            elapsed_seconds / 86_400
+        )
+
+        status, similarity, explanation = (
+            self._temporal_interpretation(
+                elapsed_days
+            )
+        )
+
+        contribution = (
+            self._contribution_for_similarity(
+                similarity=similarity,
+                status=status,
+                weight=weight,
+            )
+        )
+
+        signals.append(
+            CorrelationSignal(
+                field="observation.search_time",
+                status=status,
+                contribution=contribution,
+                explanation=explanation,
+                query_value=searched_at.isoformat(),
+                record_value=observed_at.isoformat(),
+            )
+        )
+
+    @staticmethod
+    def _temporal_interpretation(
+        elapsed_days: float,
+    ) -> tuple[
+        CorrelationSignalStatus,
+        float,
+        str,
+    ]:
+        """
+        Interpret elapsed time without assuming a fixed travel speed.
+
+        Older reports remain useful, but temporal proximity contributes more
+        strongly to the immediate local search.
+        """
+        if elapsed_days <= 1:
+            return (
+                CorrelationSignalStatus.MATCH,
+                1.0,
+                (
+                    "The report and search occurred within approximately "
+                    "one day, providing strong temporal continuity."
+                ),
+            )
+
+        if elapsed_days <= 7:
+            return (
+                CorrelationSignalStatus.MATCH,
+                0.90,
+                (
+                    "The report occurred within the previous week and "
+                    "remains strongly relevant to the search."
+                ),
+            )
+
+        if elapsed_days <= 30:
+            return (
+                CorrelationSignalStatus.PARTIAL_MATCH,
+                0.75,
+                (
+                    "The report occurred within the previous month and "
+                    "remains temporally compatible."
+                ),
+            )
+
+        if elapsed_days <= 180:
+            return (
+                CorrelationSignalStatus.PARTIAL_MATCH,
+                0.55,
+                (
+                    "Several weeks or months separate the report and search. "
+                    "The report may still be useful as historical context."
+                ),
+            )
+
+        return (
+            CorrelationSignalStatus.PARTIAL_MATCH,
+            0.35,
+            (
+                "The report is old in relation to the search, but it remains "
+                "available as historical humanitarian information."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Descriptive evidence
+    # ------------------------------------------------------------------
 
     def _append_name_signal(
         self,
@@ -383,16 +751,15 @@ class CorrelationService:
         weight: float,
     ) -> None:
         """
-        Compare a reported name or label.
+        Compare the name supplied by the person searching.
 
-        Supports:
+        The public concept is simply 'name'. Internally the comparison
+        tolerates:
 
-        - exact names;
-        - partial names;
-        - one or two surnames;
-        - surname order differences;
-        - accents and punctuation differences;
-        - small typing variants such as Maria / Marias.
+        - additional or omitted surnames;
+        - different surname order;
+        - accents and punctuation;
+        - small typing variations.
         """
         self._append_text_signal(
             signals=signals,
@@ -400,7 +767,7 @@ class CorrelationService:
             query_value=query_value,
             record_value=record_value,
             weight=weight,
-            description="reported label",
+            description="name",
             match_threshold=self.NAME_MATCH_THRESHOLD,
             partial_threshold=self.NAME_PARTIAL_THRESHOLD,
             similarity_function=self._name_similarity,
@@ -414,11 +781,7 @@ class CorrelationService:
         weight: float,
     ) -> None:
         """
-        Compare recognition features as high-value descriptive evidence.
-
-        Recognition features receive the highest individual weight because
-        they offer the greatest opportunity to connect observations created
-        independently by different people.
+        Compare recognition characteristics as high-value evidence.
         """
         self._append_text_signal(
             signals=signals,
@@ -429,31 +792,187 @@ class CorrelationService:
             description="recognition features",
             match_threshold=self.FEATURES_MATCH_THRESHOLD,
             partial_threshold=self.FEATURES_PARTIAL_THRESHOLD,
-            similarity_function=self._descriptive_text_similarity,
+            similarity_function=(
+                self._descriptive_text_similarity
+            ),
         )
 
-    def _append_animal_text_signal(
+    def _append_age_signal(
         self,
         signals: list[CorrelationSignal],
-        field: str,
-        query_value: str | None,
-        record_value: str | None,
+        query_age: int | None,
+        record_age: int | None,
         weight: float,
-        description: str,
     ) -> None:
         """
-        Compare animal species or breed.
+        Compare approximate human ages.
+
+        Rules:
+
+        - exact age:
+          complete match;
+
+        - difference from one to three years:
+          strong match;
+
+        - difference from four to ten years:
+          partial match;
+
+        - difference greater than ten years:
+          conflict.
+
+        Age remains approximate and never establishes identity.
+        """
+        if query_age is None:
+            return
+
+        if record_age is None:
+            signals.append(
+                CorrelationSignal(
+                    field="subject.estimated_age",
+                    status=CorrelationSignalStatus.NOT_AVAILABLE,
+                    contribution=0.0,
+                    explanation=(
+                        "The candidate report does not contain estimated "
+                        "age information."
+                    ),
+                    query_value=query_age,
+                    record_value=None,
+                )
+            )
+
+            return
+
+        difference = abs(
+            query_age - record_age
+        )
+
+        if difference == 0:
+            status = CorrelationSignalStatus.MATCH
+            similarity = 1.0
+            explanation = (
+                "The estimated ages are equal."
+            )
+
+        elif difference <= self.STRONG_AGE_TOLERANCE:
+            status = CorrelationSignalStatus.MATCH
+            similarity = max(
+                0.85,
+                1.0 - difference * 0.05,
+            )
+            explanation = (
+                "The estimated ages are strongly compatible, with a "
+                f"difference of {difference} "
+                f"year{'' if difference == 1 else 's'}."
+            )
+
+        elif difference <= self.BROAD_AGE_TOLERANCE:
+            status = (
+                CorrelationSignalStatus.PARTIAL_MATCH
+            )
+            similarity = max(
+                0.35,
+                1.0
+                - (
+                    difference
+                    / self.BROAD_AGE_TOLERANCE
+                ),
+            )
+            explanation = (
+                "The estimated ages are partially compatible, with a "
+                f"difference of {difference} years."
+            )
+
+        else:
+            status = CorrelationSignalStatus.CONFLICT
+            similarity = 0.0
+            explanation = (
+                "The estimated ages differ by more than ten years."
+            )
+
+        contribution = (
+            self._contribution_for_similarity(
+                similarity=similarity,
+                status=status,
+                weight=weight,
+            )
+        )
+
+        signals.append(
+            CorrelationSignal(
+                field="subject.estimated_age",
+                status=status,
+                contribution=contribution,
+                explanation=explanation,
+                query_value=query_age,
+                record_value=record_age,
+            )
+        )
+
+    def _append_animal_signals(
+        self,
+        signals: list[CorrelationSignal],
+        query: HumanitarianQuery,
+        record: HumanitarianRecord,
+    ) -> None:
+        """
+        Append species, breed and size evidence for animals.
         """
         self._append_text_signal(
             signals=signals,
-            field=field,
-            query_value=query_value,
-            record_value=record_value,
-            weight=weight,
-            description=description,
-            match_threshold=self.ANIMAL_TEXT_MATCH_THRESHOLD,
-            partial_threshold=self.ANIMAL_TEXT_PARTIAL_THRESHOLD,
-            similarity_function=self._descriptive_text_similarity,
+            field="subject.species",
+            query_value=query.subject.species,
+            record_value=getattr(
+                record.subject,
+                "species",
+                None,
+            ),
+            weight=self.ANIMAL_SPECIES_WEIGHT,
+            description="species",
+            match_threshold=(
+                self.ANIMAL_TEXT_MATCH_THRESHOLD
+            ),
+            partial_threshold=(
+                self.ANIMAL_TEXT_PARTIAL_THRESHOLD
+            ),
+            similarity_function=(
+                self._descriptive_text_similarity
+            ),
+        )
+
+        self._append_text_signal(
+            signals=signals,
+            field="subject.breed",
+            query_value=query.subject.breed,
+            record_value=getattr(
+                record.subject,
+                "breed",
+                None,
+            ),
+            weight=self.ANIMAL_BREED_WEIGHT,
+            description="breed",
+            match_threshold=(
+                self.ANIMAL_TEXT_MATCH_THRESHOLD
+            ),
+            partial_threshold=(
+                self.ANIMAL_TEXT_PARTIAL_THRESHOLD
+            ),
+            similarity_function=(
+                self._descriptive_text_similarity
+            ),
+        )
+
+        self._append_exact_signal(
+            signals=signals,
+            field="subject.size",
+            query_value=query.subject.size,
+            record_value=getattr(
+                record.subject,
+                "size",
+                None,
+            ),
+            weight=self.ANIMAL_SIZE_WEIGHT,
+            description="animal size",
         )
 
     def _append_text_signal(
@@ -466,10 +985,13 @@ class CorrelationService:
         description: str,
         match_threshold: float,
         partial_threshold: float,
-        similarity_function,
+        similarity_function: Callable[
+            [str, str],
+            float,
+        ],
     ) -> None:
         """
-        Compare one free-text field and append an explainable signal.
+        Compare one text field and append an explainable signal.
         """
         if query_value is None:
             return
@@ -481,13 +1003,14 @@ class CorrelationService:
                     status=CorrelationSignalStatus.NOT_AVAILABLE,
                     contribution=0.0,
                     explanation=(
-                        f"The candidate record does not contain "
-                        f"{description} evidence."
+                        f"The candidate report does not contain "
+                        f"{description} information."
                     ),
                     query_value=query_value,
                     record_value=None,
                 )
             )
+
             return
 
         similarity = similarity_function(
@@ -501,10 +1024,12 @@ class CorrelationService:
             partial_threshold=partial_threshold,
         )
 
-        contribution = self._contribution_for_similarity(
-            similarity=similarity,
-            status=status,
-            weight=weight,
+        contribution = (
+            self._contribution_for_similarity(
+                similarity=similarity,
+                status=status,
+                weight=weight,
+            )
         )
 
         signals.append(
@@ -522,124 +1047,6 @@ class CorrelationService:
             )
         )
 
-    def _append_age_signal(
-        self,
-        signals: list[CorrelationSignal],
-        query_age: int | None,
-        record_age: int | None,
-        weight: float,
-    ) -> None:
-        """
-        Compare estimated human ages.
-
-        Rules:
-
-        - exact age:
-          full match;
-
-        - difference of one to three years:
-          strong compatibility;
-
-        - difference of four to seven years:
-          partial compatibility;
-
-        - difference greater than seven years:
-          conflict.
-
-        Age remains approximate evidence and must never establish identity.
-        """
-        if query_age is None:
-            return
-
-        if record_age is None:
-            signals.append(
-                CorrelationSignal(
-                    field="subject.estimated_age",
-                    status=CorrelationSignalStatus.NOT_AVAILABLE,
-                    contribution=0.0,
-                    explanation=(
-                        "The candidate record does not contain estimated "
-                        "age evidence."
-                    ),
-                    query_value=query_age,
-                    record_value=None,
-                )
-            )
-            return
-
-        difference = abs(query_age - record_age)
-
-        if difference == 0:
-            status = CorrelationSignalStatus.MATCH
-            similarity = 1.0
-            explanation = "The estimated ages are equal."
-
-        elif difference <= self.STRONG_AGE_TOLERANCE:
-            status = CorrelationSignalStatus.MATCH
-
-            similarity = (
-                1.0
-                - (
-                    difference
-                    / (
-                        self.STRONG_AGE_TOLERANCE
-                        + 1
-                    )
-                    * 0.12
-                )
-            )
-
-            explanation = (
-                "The estimated ages are strongly compatible "
-                f"within a difference of {difference} "
-                f"year{'' if difference == 1 else 's'}."
-            )
-
-        elif difference <= self.BROAD_AGE_TOLERANCE:
-            status = CorrelationSignalStatus.PARTIAL_MATCH
-
-            similarity = max(
-                0.45,
-                1.0
-                - (
-                    difference
-                    / self.BROAD_AGE_TOLERANCE
-                ),
-            )
-
-            explanation = (
-                "The estimated ages are partially compatible "
-                f"with a difference of {difference} years."
-            )
-
-        else:
-            status = CorrelationSignalStatus.CONFLICT
-            similarity = 0.0
-            explanation = (
-                "The estimated ages are conflicting "
-                f"with a difference of {difference} years."
-            )
-
-        contribution = (
-            weight * similarity
-            if status != CorrelationSignalStatus.CONFLICT
-            else 0.0
-        )
-
-        signals.append(
-            CorrelationSignal(
-                field="subject.estimated_age",
-                status=status,
-                contribution=round(
-                    contribution,
-                    2,
-                ),
-                explanation=explanation,
-                query_value=query_age,
-                record_value=record_age,
-            )
-        )
-
     def _append_exact_signal(
         self,
         signals: list[CorrelationSignal],
@@ -651,8 +1058,6 @@ class CorrelationService:
     ) -> None:
         """
         Compare one canonical categorical value.
-
-        Used for fields such as animal size, not event type.
         """
         if query_value is None:
             return
@@ -664,13 +1069,14 @@ class CorrelationService:
                     status=CorrelationSignalStatus.NOT_AVAILABLE,
                     contribution=0.0,
                     explanation=(
-                        f"The candidate record does not contain "
-                        f"{description} evidence."
+                        f"The candidate report does not contain "
+                        f"{description} information."
                     ),
                     query_value=query_value,
                     record_value=None,
                 )
             )
+
             return
 
         query_normalized = self._normalize_text(
@@ -683,29 +1089,35 @@ class CorrelationService:
 
         if (
             query_normalized
-            and query_normalized == record_normalized
+            and query_normalized
+            == record_normalized
         ):
             status = CorrelationSignalStatus.MATCH
-            contribution = weight
+            similarity = 1.0
             explanation = (
                 f"The {description} values are equal."
             )
 
         else:
             status = CorrelationSignalStatus.CONFLICT
-            contribution = 0.0
+            similarity = 0.0
             explanation = (
                 f"The {description} values are different."
             )
+
+        contribution = (
+            self._contribution_for_similarity(
+                similarity=similarity,
+                status=status,
+                weight=weight,
+            )
+        )
 
         signals.append(
             CorrelationSignal(
                 field=field,
                 status=status,
-                contribution=round(
-                    contribution,
-                    2,
-                ),
+                contribution=contribution,
                 explanation=explanation,
                 query_value=query_value,
                 record_value=record_value,
@@ -713,7 +1125,7 @@ class CorrelationService:
         )
 
     # ------------------------------------------------------------------
-    # Score calculation
+    # Compatibility and evidence strength
     # ------------------------------------------------------------------
 
     def _calculate_compatibility_score(
@@ -722,15 +1134,12 @@ class CorrelationService:
         subject_type: str,
     ) -> float:
         """
-        Calculate similarity among evidence that was actually compared.
+        Calculate compatibility among evidence that was actually compared.
 
-        Missing candidate evidence is excluded from the denominator.
+        NOT_AVAILABLE evidence is excluded from the denominator.
 
-        Therefore:
-
-        - exact name + exact age can produce 100% compatibility;
-        - the result may still have only moderate evidence strength because
-          few independent fields were supplied.
+        This prevents absent information from artificially lowering the
+        similarity of fields that did match.
         """
         weights = self._weights_for_subject(
             subject_type
@@ -746,13 +1155,17 @@ class CorrelationService:
             ):
                 continue
 
-            weight = weights.get(signal.field)
+            weight = weights.get(
+                signal.field
+            )
 
             if weight is None:
                 continue
 
             compared_weight += weight
-            total_contribution += signal.contribution
+            total_contribution += (
+                signal.contribution
+            )
 
         if compared_weight == 0.0:
             return 0.0
@@ -764,7 +1177,13 @@ class CorrelationService:
         )
 
         return round(
-            min(max(score, 0.0), 100.0),
+            min(
+                max(
+                    score,
+                    0.0,
+                ),
+                100.0,
+            ),
             2,
         )
 
@@ -774,23 +1193,12 @@ class CorrelationService:
         subject_type: str,
     ) -> float:
         """
-        Estimate how much independent evidence supports the result.
+        Calculate how much independent evidence supports the result.
 
-        This value is used only to derive the confidence/evidence level.
+        The denominator includes the complete evidence capacity for the
+        selected subject type.
 
-        Unlike compatibility, its denominator includes the complete
-        descriptive evidence capacity for the subject type.
-
-        Consequently:
-
-        - exact name alone:
-          high compatibility, low evidence strength;
-
-        - exact name and age:
-          high compatibility, moderate evidence strength;
-
-        - name, age and recognition features:
-          high compatibility and high evidence strength.
+        Compatibility and evidence strength therefore remain separate.
         """
         weights = self._weights_for_subject(
             subject_type
@@ -806,29 +1214,33 @@ class CorrelationService:
         supported_weight = 0.0
 
         for signal in signals:
-            weight = weights.get(signal.field)
+            weight = weights.get(
+                signal.field
+            )
 
             if weight is None:
                 continue
 
-            if signal.status == CorrelationSignalStatus.MATCH:
+            if (
+                signal.status
+                == CorrelationSignalStatus.MATCH
+            ):
                 supported_weight += weight
 
             elif (
                 signal.status
                 == CorrelationSignalStatus.PARTIAL_MATCH
             ):
-                if weight <= 0.0:
-                    continue
-
                 similarity_fraction = (
                     signal.contribution / weight
+                    if weight > 0
+                    else 0.0
                 )
 
                 supported_weight += (
                     weight
                     * max(
-                        0.35,
+                        0.25,
                         min(
                             similarity_fraction,
                             1.0,
@@ -858,27 +1270,42 @@ class CorrelationService:
         subject_type: str,
     ) -> dict[str, float]:
         """
-        Return evidence weights for one subject type.
+        Return the evidence map used by score calculations.
         """
         if subject_type == "human":
             return {
-                "subject.reported_label": (
-                    self.HUMAN_REPORTED_LABEL_WEIGHT
-                ),
-                "subject.estimated_age": (
-                    self.HUMAN_ESTIMATED_AGE_WEIGHT
-                ),
-                "subject.recognition_features": (
-                    self.HUMAN_RECOGNITION_FEATURES_WEIGHT
+                "observation.declared_location": (
+                    self.HUMAN_SPATIAL_WEIGHT
                 ),
                 "observation.reported_location": (
-                    self.HUMAN_REPORTED_LOCATION_WEIGHT
+                    self.HUMAN_SPATIAL_WEIGHT
+                ),
+                "observation.search_time": (
+                    self.HUMAN_TEMPORAL_WEIGHT
+                ),
+                "subject.reported_label": (
+                    self.HUMAN_NAME_WEIGHT
+                ),
+                "subject.estimated_age": (
+                    self.HUMAN_AGE_WEIGHT
+                ),
+                "subject.recognition_features": (
+                    self.HUMAN_FEATURES_WEIGHT
                 ),
             }
 
         return {
+            "observation.declared_location": (
+                self.ANIMAL_SPATIAL_WEIGHT
+            ),
+            "observation.reported_location": (
+                self.ANIMAL_SPATIAL_WEIGHT
+            ),
+            "observation.search_time": (
+                self.ANIMAL_TEMPORAL_WEIGHT
+            ),
             "subject.reported_label": (
-                self.ANIMAL_REPORTED_LABEL_WEIGHT
+                self.ANIMAL_NAME_WEIGHT
             ),
             "subject.species": (
                 self.ANIMAL_SPECIES_WEIGHT
@@ -890,15 +1317,48 @@ class CorrelationService:
                 self.ANIMAL_SIZE_WEIGHT
             ),
             "subject.recognition_features": (
-                self.ANIMAL_RECOGNITION_FEATURES_WEIGHT
-            ),
-            "observation.reported_location": (
-                self.ANIMAL_REPORTED_LOCATION_WEIGHT
+                self.ANIMAL_FEATURES_WEIGHT
             ),
         }
 
+    def _spatial_weight(
+        self,
+        subject_type: str,
+    ) -> float:
+        if subject_type == "human":
+            return self.HUMAN_SPATIAL_WEIGHT
+
+        return self.ANIMAL_SPATIAL_WEIGHT
+
+    def _temporal_weight(
+        self,
+        subject_type: str,
+    ) -> float:
+        if subject_type == "human":
+            return self.HUMAN_TEMPORAL_WEIGHT
+
+        return self.ANIMAL_TEMPORAL_WEIGHT
+
+    def _name_weight(
+        self,
+        subject_type: str,
+    ) -> float:
+        if subject_type == "human":
+            return self.HUMAN_NAME_WEIGHT
+
+        return self.ANIMAL_NAME_WEIGHT
+
+    def _features_weight(
+        self,
+        subject_type: str,
+    ) -> float:
+        if subject_type == "human":
+            return self.HUMAN_FEATURES_WEIGHT
+
+        return self.ANIMAL_FEATURES_WEIGHT
+
     # ------------------------------------------------------------------
-    # Similarity helpers
+    # Explanation helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -907,14 +1367,13 @@ class CorrelationService:
         match_threshold: float,
         partial_threshold: float,
     ) -> CorrelationSignalStatus:
-        """
-        Convert similarity into an explainable signal status.
-        """
         if similarity >= match_threshold:
             return CorrelationSignalStatus.MATCH
 
         if similarity >= partial_threshold:
-            return CorrelationSignalStatus.PARTIAL_MATCH
+            return (
+                CorrelationSignalStatus.PARTIAL_MATCH
+            )
 
         return CorrelationSignalStatus.CONFLICT
 
@@ -924,9 +1383,6 @@ class CorrelationService:
         status: CorrelationSignalStatus,
         weight: float,
     ) -> float:
-        """
-        Calculate the positive contribution of one signal.
-        """
         if status == CorrelationSignalStatus.CONFLICT:
             return 0.0
 
@@ -941,9 +1397,6 @@ class CorrelationService:
         similarity: float,
         status: CorrelationSignalStatus,
     ) -> str:
-        """
-        Build a human-readable explanation for a text comparison.
-        """
         similarity_percentage = round(
             similarity * 100
         )
@@ -968,18 +1421,45 @@ class CorrelationService:
             f"({similarity_percentage}% textual similarity)."
         )
 
+    @staticmethod
+    def _legacy_location_explanation(
+        similarity: float,
+        status: CorrelationSignalStatus,
+    ) -> str:
+        percentage = round(
+            similarity * 100
+        )
+
+        if status == CorrelationSignalStatus.MATCH:
+            return (
+                "The legacy free-text locations are strongly compatible "
+                f"({percentage}% textual similarity)."
+            )
+
+        if (
+            status
+            == CorrelationSignalStatus.PARTIAL_MATCH
+        ):
+            return (
+                "The legacy free-text locations are partially compatible "
+                f"({percentage}% textual similarity)."
+            )
+
+        return (
+            "The legacy free-text locations are not sufficiently compatible "
+            f"({percentage}% textual similarity)."
+        )
+
+    # ------------------------------------------------------------------
+    # Similarity helpers
+    # ------------------------------------------------------------------
+
     @classmethod
     def _name_similarity(
         cls,
         first_value: str,
         second_value: str,
     ) -> float:
-        """
-        Calculate similarity between human-entered names.
-
-        The comparison supports partial names, surname order differences
-        and small typing variations.
-        """
         first_normalized = cls._normalize_text(
             first_value
         )
@@ -1000,41 +1480,29 @@ class CorrelationService:
         first_tokens = first_normalized.split()
         second_tokens = second_normalized.split()
 
-        sequence_score = SequenceMatcher(
-            None,
-            first_normalized,
-            second_normalized,
-        ).ratio()
-
-        containment_score = cls._containment_score(
-            first_normalized,
-            second_normalized,
-        )
-
-        exact_token_score = cls._token_overlap_score(
-            first_tokens,
-            second_tokens,
-        )
-
-        fuzzy_token_score = (
-            cls._fuzzy_token_overlap_score(
-                first_tokens,
-                second_tokens,
-            )
-        )
-
-        name_core_score = cls._name_core_score(
-            first_tokens,
-            second_tokens,
-        )
-
         return round(
             max(
-                sequence_score,
-                containment_score,
-                exact_token_score,
-                fuzzy_token_score,
-                name_core_score,
+                SequenceMatcher(
+                    None,
+                    first_normalized,
+                    second_normalized,
+                ).ratio(),
+                cls._containment_score(
+                    first_normalized,
+                    second_normalized,
+                ),
+                cls._token_overlap_score(
+                    first_tokens,
+                    second_tokens,
+                ),
+                cls._fuzzy_token_overlap_score(
+                    first_tokens,
+                    second_tokens,
+                ),
+                cls._name_core_score(
+                    first_tokens,
+                    second_tokens,
+                ),
             ),
             4,
         )
@@ -1045,13 +1513,6 @@ class CorrelationService:
         first_value: str,
         second_value: str,
     ) -> float:
-        """
-        Calculate similarity between human-entered descriptions.
-
-        Short descriptions can remain strongly compatible with longer
-        descriptions when their meaningful words are contained or closely
-        represented.
-        """
         first_normalized = cls._normalize_text(
             first_value
         )
@@ -1072,41 +1533,29 @@ class CorrelationService:
         first_tokens = first_normalized.split()
         second_tokens = second_normalized.split()
 
-        sequence_score = SequenceMatcher(
-            None,
-            first_normalized,
-            second_normalized,
-        ).ratio()
-
-        containment_score = cls._containment_score(
-            first_normalized,
-            second_normalized,
-        )
-
-        exact_token_score = cls._token_overlap_score(
-            first_tokens,
-            second_tokens,
-        )
-
-        fuzzy_token_score = (
-            cls._fuzzy_token_overlap_score(
-                first_tokens,
-                second_tokens,
-            )
-        )
-
-        coverage_score = cls._shorter_text_coverage(
-            first_tokens,
-            second_tokens,
-        )
-
         return round(
             max(
-                sequence_score,
-                containment_score,
-                exact_token_score,
-                fuzzy_token_score,
-                coverage_score,
+                SequenceMatcher(
+                    None,
+                    first_normalized,
+                    second_normalized,
+                ).ratio(),
+                cls._containment_score(
+                    first_normalized,
+                    second_normalized,
+                ),
+                cls._token_overlap_score(
+                    first_tokens,
+                    second_tokens,
+                ),
+                cls._fuzzy_token_overlap_score(
+                    first_tokens,
+                    second_tokens,
+                ),
+                cls._shorter_text_coverage(
+                    first_tokens,
+                    second_tokens,
+                ),
             ),
             4,
         )
@@ -1116,9 +1565,6 @@ class CorrelationService:
         first_value: str,
         second_value: str,
     ) -> float:
-        """
-        Score direct containment.
-        """
         if (
             first_value not in second_value
             and second_value not in first_value
@@ -1138,13 +1584,8 @@ class CorrelationService:
         if longest_length == 0:
             return 0.0
 
-        raw_ratio = (
-            shortest_length
-            / longest_length
-        )
-
         return max(
-            raw_ratio,
+            shortest_length / longest_length,
             0.75,
         )
 
@@ -1153,31 +1594,28 @@ class CorrelationService:
         first_tokens: list[str],
         second_tokens: list[str],
     ) -> float:
-        """
-        Measure exact token coverage using the shorter side.
-        """
-        first_set = set(first_tokens)
-        second_set = set(second_tokens)
+        first_set = set(
+            first_tokens
+        )
+
+        second_set = set(
+            second_tokens
+        )
 
         if not first_set or not second_set:
             return 0.0
-
-        shared = (
-            first_set.intersection(
-                second_set
-            )
-        )
 
         denominator = min(
             len(first_set),
             len(second_set),
         )
 
-        if denominator == 0:
-            return 0.0
-
         return (
-            len(shared)
+            len(
+                first_set.intersection(
+                    second_set
+                )
+            )
             / denominator
         )
 
@@ -1186,9 +1624,6 @@ class CorrelationService:
         first_tokens: list[str],
         second_tokens: list[str],
     ) -> float:
-        """
-        Measure token overlap while tolerating minor typing variations.
-        """
         if not first_tokens or not second_tokens:
             return 0.0
 
@@ -1240,29 +1675,33 @@ class CorrelationService:
             * average_similarity
         )
 
-    @staticmethod
+    @classmethod
     def _name_core_score(
+        cls,
         first_tokens: list[str],
         second_tokens: list[str],
     ) -> float:
-        """
-        Compare first name and available surnames without requiring equal
-        name length or surname order.
-        """
         if not first_tokens or not second_tokens:
             return 0.0
 
-        first_name_similarity = SequenceMatcher(
-            None,
-            first_tokens[0],
-            second_tokens[0],
-        ).ratio()
+        first_name_similarity = (
+            SequenceMatcher(
+                None,
+                first_tokens[0],
+                second_tokens[0],
+            ).ratio()
+        )
 
         if first_name_similarity < 0.72:
             return 0.0
 
-        first_surnames = first_tokens[1:]
-        second_surnames = second_tokens[1:]
+        first_surnames = (
+            first_tokens[1:]
+        )
+
+        second_surnames = (
+            second_tokens[1:]
+        )
 
         if (
             not first_surnames
@@ -1274,8 +1713,7 @@ class CorrelationService:
             )
 
         surname_similarity = (
-            CorrelationService
-            ._fuzzy_token_overlap_score(
+            cls._fuzzy_token_overlap_score(
                 first_surnames,
                 second_surnames,
             )
@@ -1291,10 +1729,6 @@ class CorrelationService:
         first_tokens: list[str],
         second_tokens: list[str],
     ) -> float:
-        """
-        Measure how much of the shorter description appears in the longer
-        description.
-        """
         if not first_tokens or not second_tokens:
             return 0.0
 
@@ -1334,12 +1768,41 @@ class CorrelationService:
         )
 
     @staticmethod
+    def _location_level_similarity(
+        first_value: str,
+        second_value: str,
+    ) -> float:
+        return (
+            CorrelationService
+            ._descriptive_text_similarity(
+                first_value,
+                second_value,
+            )
+        )
+
+    @staticmethod
+    def _optional_location_level_similarity(
+        first_value: str | None,
+        second_value: str | None,
+    ) -> float | None:
+        if (
+            first_value is None
+            or second_value is None
+        ):
+            return None
+
+        return (
+            CorrelationService
+            ._descriptive_text_similarity(
+                first_value,
+                second_value,
+            )
+        )
+
+    @staticmethod
     def _normalize_text(
         value: str,
     ) -> str:
-        """
-        Normalize human-entered text before deterministic comparison.
-        """
         decomposed = unicodedata.normalize(
             "NFKD",
             value.strip().casefold(),
@@ -1363,3 +1826,73 @@ class CorrelationService:
         return " ".join(
             alphanumeric_text.split()
         )
+
+    # ------------------------------------------------------------------
+    # Time helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _elapsed_days(
+        searched_at: datetime | None,
+        observed_at: datetime,
+    ) -> float:
+        if searched_at is None:
+            return 0.0
+
+        return max(
+            0.0,
+            (
+                searched_at
+                - observed_at
+            ).total_seconds()
+            / 86_400,
+        )
+
+    @staticmethod
+    def _format_days(
+        value: float,
+    ) -> str:
+        rounded_days = round(
+            value
+        )
+
+        return (
+            f"{rounded_days} day"
+            f"{'' if rounded_days == 1 else 's'}"
+        )
+
+    @staticmethod
+    def _confidence_sort_value(
+        value: str,
+    ) -> int:
+        order = {
+            "very_low": 0,
+            "low": 1,
+            "moderate": 2,
+            "medium": 2,
+            "high": 3,
+            "very_high": 4,
+        }
+
+        return order.get(
+            value,
+            0,
+        )
+
+
+class SpatialComparison:
+    """
+    Internal explanation of structured geographic compatibility.
+
+    This is an implementation object, not a canonical HCP model.
+    """
+
+    def __init__(
+        self,
+        status: CorrelationSignalStatus,
+        similarity: float,
+        explanation: str,
+    ) -> None:
+        self.status = status
+        self.similarity = similarity
+        self.explanation = explanation
