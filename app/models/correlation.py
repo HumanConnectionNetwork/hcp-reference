@@ -2,9 +2,16 @@ from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import Field, field_serializer, model_validator
+from pydantic import (
+    Field,
+    field_serializer,
+    model_validator,
+)
 
-from app.models.humanitarian_record import HCPModel, NonEmptyString
+from app.models.humanitarian_record import (
+    HCPModel,
+    NonEmptyString,
+)
 
 
 CorrelationScore = Annotated[
@@ -12,7 +19,10 @@ CorrelationScore = Annotated[
     Field(
         ge=0.0,
         le=100.0,
-        description="Correlation score expressed as a percentage.",
+        description=(
+            "Descriptive, spatial and temporal compatibility expressed "
+            "as a percentage."
+        ),
     ),
 ]
 
@@ -22,17 +32,30 @@ SignalContribution = Annotated[
     Field(
         ge=0.0,
         le=100.0,
-        description="Contribution of one signal to the correlation score.",
+        description=(
+            "Contribution of one supporting signal to the compatibility "
+            "score."
+        ),
     ),
 ]
 
 
 class CorrelationConfidence(StrEnum):
     """
-    Human-readable interpretation of a correlation score.
+    Human-readable strength of the evidence available for a correlation.
 
-    Confidence describes the strength of the available evidence. It does not
-    confirm that two observations refer to the same human or animal.
+    Confidence is independent from the compatibility score.
+
+    Examples:
+
+    - compatibility may be very high because a name matches exactly,
+      while evidence strength remains low because no age, location or
+      descriptive features are available;
+
+    - compatibility may be moderate while evidence strength is high because
+      many independent fields were compared and some of them conflict.
+
+    Confidence never confirms identity.
     """
 
     VERY_LOW = "very_low"
@@ -55,10 +78,17 @@ class CorrelationSignalStatus(StrEnum):
 
 class CorrelationSignal(HCPModel):
     """
-    Explainable contribution of one humanitarian evidence signal.
+    Explainable comparison of one humanitarian evidence signal.
 
-    A signal records which field was evaluated, how it compared and how much
-    it contributed to the final correlation score.
+    A signal records:
+
+    - which field was evaluated;
+    - whether it supports or conflicts with the candidate;
+    - how much it contributes to compatibility;
+    - the values that were compared.
+
+    Signals describe compatibility between reports. They do not establish
+    identity.
     """
 
     field: NonEmptyString
@@ -69,15 +99,31 @@ class CorrelationSignal(HCPModel):
 
     explanation: NonEmptyString
 
-    query_value: str | int | float | bool | None = None
+    query_value: (
+        str
+        | int
+        | float
+        | bool
+        | None
+    ) = None
 
-    record_value: str | int | float | bool | None = None
+    record_value: (
+        str
+        | int
+        | float
+        | bool
+        | None
+    ) = None
 
     @model_validator(mode="after")
-    def validate_signal_contribution(self) -> "CorrelationSignal":
+    def validate_signal_contribution(
+        self,
+    ) -> "CorrelationSignal":
         """
-        Ensure conflicting or unavailable evidence does not contribute
-        positively to the correlation score.
+        Ensure only supporting signals contribute positively.
+
+        Conflicting and unavailable evidence remains visible for human
+        interpretation, but cannot increase the compatibility score.
         """
         if (
             self.status
@@ -97,67 +143,125 @@ class CorrelationSignal(HCPModel):
 
 class CorrelationResult(HCPModel):
     """
-    Explainable local correlation between an HCP Query and one candidate
+    Explainable local correlation between one HCP Query and one candidate
     Humanitarian Record.
 
-    The result expresses compatibility between humanitarian observations.
-    It must never be interpreted as identity confirmation.
+    score:
+        Compatibility between the evidence values that could be compared.
+
+    confidence:
+        Strength and breadth of the available evidence.
+
+    These values are intentionally independent.
+
+    A result with 100% compatibility may still have low evidence strength
+    when only one weak or common field was available.
+
+    A result with moderate compatibility may have high evidence strength
+    when several independent signals were evaluated.
+
+    Neither score nor confidence confirms identity.
     """
 
     record_id: UUID
 
-    subject_type: Literal["human", "animal"]
+    subject_type: Literal[
+        "human",
+        "animal",
+    ]
 
     score: CorrelationScore
 
     confidence: CorrelationConfidence
 
-    signals: list[CorrelationSignal] = Field(default_factory=list)
+    signals: list[
+        CorrelationSignal
+    ] = Field(
+        default_factory=list
+    )
 
-    @field_serializer("record_id", when_used="json")
-    def serialize_record_id(self, value: UUID) -> str:
+    @field_serializer(
+        "record_id",
+        when_used="json",
+    )
+    def serialize_record_id(
+        self,
+        value: UUID,
+    ) -> str:
         """
-        Serialize the candidate record identifier as a lowercase UUID string.
+        Serialize the candidate record identifier as a canonical UUID string.
         """
         return str(value)
 
     @model_validator(mode="after")
-    def validate_confidence_for_score(self) -> "CorrelationResult":
+    def validate_result_consistency(
+        self,
+    ) -> "CorrelationResult":
         """
-        Ensure the confidence label corresponds to the numerical score.
+        Validate only structural consistency.
 
-        Score bands are presentation categories used by this reference
-        implementation. They do not represent identity certainty.
+        Compatibility score and evidence strength are not required to belong
+        to the same numerical band.
         """
-        expected_confidence = confidence_from_score(self.score)
+        supporting_signals = [
+            signal
+            for signal in self.signals
+            if signal.status
+            in {
+                CorrelationSignalStatus.MATCH,
+                CorrelationSignalStatus.PARTIAL_MATCH,
+            }
+        ]
 
-        if self.confidence != expected_confidence:
+        if (
+            self.score > 0.0
+            and not supporting_signals
+        ):
             raise ValueError(
-                "confidence does not correspond to the correlation score; "
-                f"expected '{expected_confidence.value}'"
+                "a positive correlation score requires at least one "
+                "supporting signal"
             )
 
         return self
 
 
-def confidence_from_score(score: float) -> CorrelationConfidence:
+def confidence_from_score(
+    score: float,
+) -> CorrelationConfidence:
     """
-    Convert a correlation percentage into a human-readable confidence band.
+    Convert an evidence-strength percentage into a readable evidence band.
 
-    These bands make results easier to present consistently while preserving
-    the original numerical score.
+    Despite the historical function name, callers may pass an independently
+    calculated evidence-strength value rather than the compatibility score.
+
+    The function remains available under its current name to preserve
+    compatibility with existing services.
     """
     if score >= 85.0:
-        return CorrelationConfidence.VERY_HIGH
+        return (
+            CorrelationConfidence
+            .VERY_HIGH
+        )
 
     if score >= 70.0:
-        return CorrelationConfidence.HIGH
+        return (
+            CorrelationConfidence
+            .HIGH
+        )
 
     if score >= 50.0:
-        return CorrelationConfidence.MODERATE
+        return (
+            CorrelationConfidence
+            .MODERATE
+        )
 
     if score >= 30.0:
-        return CorrelationConfidence.LOW
+        return (
+            CorrelationConfidence
+            .LOW
+        )
 
-    return CorrelationConfidence.VERY_LOW
-
+    return (
+        CorrelationConfidence
+        .VERY_LOW
+    )
