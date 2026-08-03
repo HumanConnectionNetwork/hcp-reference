@@ -34,6 +34,7 @@ from app.core.errors import (
     StorageError,
 )
 from app.models.humanitarian_record import HumanitarianRecord
+from app.models.query import HumanitarianQuery
 from app.storage.base import RecordStorage
 
 
@@ -476,6 +477,110 @@ class PostgresRecordStorage(RecordStorage):
         except SQLAlchemyError as exc:
             raise StorageError(
                 "Unable to list Humanitarian Records from PostgreSQL"
+            ) from exc
+
+        return [
+            self._payload_to_record(
+                payload=row["record_payload"],
+                record_id=row["id"],
+            )
+            for row in rows
+        ]
+
+    def search_candidates(
+        self,
+        query: HumanitarianQuery,
+        limit: int = 100,
+    ) -> list[HumanitarianRecord]:
+        """
+        Return a bounded preliminary candidate collection using indexed SQL.
+
+        PostgreSQL performs only inexpensive structural filtering here. It
+        does not calculate HCP compatibility, similarity or continuity.
+
+        Applied filters:
+
+        - subject type is always required;
+        - country is applied when structured location is available;
+        - first administrative level is applied when available.
+
+        SearchService remains responsible for evaluating descriptive and
+        semantic evidence such as names, age, recognition features, species,
+        breed and spatial compatibility.
+        """
+        self._ensure_open()
+
+        if limit < 1:
+            raise ValueError(
+                "candidate search limit must be greater than or equal to 1"
+            )
+
+        statement = (
+            select(
+                humanitarian_records_table.c.id,
+                humanitarian_records_table.c.record_payload,
+            )
+            .where(
+                humanitarian_records_table.c.subject_type
+                == query.subject.type
+            )
+        )
+
+        declared_location = query.declared_location()
+
+        if declared_location is not None:
+            country_code = self._location_value(
+                declared_location,
+                "country_code",
+                uppercase=True,
+            )
+
+            admin_level_1 = self._location_value(
+                declared_location,
+                "admin_level_1",
+            )
+
+            admin_level_1_normalized = (
+                self._normalize_search_text(
+                    admin_level_1
+                )
+            )
+
+            if country_code is not None:
+                statement = statement.where(
+                    humanitarian_records_table.c.country_code
+                    == country_code
+                )
+
+            if admin_level_1_normalized is not None:
+                statement = statement.where(
+                    humanitarian_records_table.c.admin_level_1_normalized
+                    == admin_level_1_normalized
+                )
+
+        statement = (
+            statement
+            .order_by(
+                humanitarian_records_table.c.observed_at.desc(),
+                humanitarian_records_table.c.id.asc(),
+            )
+            .limit(limit)
+        )
+
+        try:
+            with self.engine.connect() as connection:
+                rows = (
+                    connection.execute(
+                        statement
+                    )
+                    .mappings()
+                    .all()
+                )
+
+        except SQLAlchemyError as exc:
+            raise StorageError(
+                "Unable to search Humanitarian Record candidates in "
+                "PostgreSQL"
             ) from exc
 
         return [
