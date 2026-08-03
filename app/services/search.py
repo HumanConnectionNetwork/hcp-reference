@@ -95,9 +95,18 @@ class SearchService:
             )
 
         try:
+            candidate_limit = self._candidate_fetch_limit(
+                result_limit=limit,
+            )
+
+            candidate_records = self.storage.search_candidates(
+                query=query,
+                limit=candidate_limit,
+            )
+
             evaluations = [
                 evaluation
-                for record in self.storage.list_all()
+                for record in candidate_records
                 if (
                     evaluation := self._evaluate_candidate(
                         query=query,
@@ -133,6 +142,36 @@ class SearchService:
             raise QueryProcessingError(
                 "Unable to process the local Humanitarian Record search"
             ) from exc
+
+    @staticmethod
+    def _candidate_fetch_limit(
+        result_limit: int | None,
+    ) -> int:
+        """
+        Calculate the preliminary storage window for candidate evaluation.
+
+        Storage-level filters are intentionally broader and cheaper than the
+        semantic rules applied by SearchService. A wider preliminary window
+        therefore prevents valid matches from being lost before descriptive
+        evaluation while still keeping PostgreSQL reads bounded.
+
+        Args:
+            result_limit:
+                Maximum number of evaluated records requested by the caller.
+
+        Returns:
+            Maximum number of preliminary records requested from storage.
+        """
+        default_candidate_limit = 100
+        candidate_multiplier = 5
+
+        if result_limit is None:
+            return default_candidate_limit
+
+        return max(
+            default_candidate_limit,
+            result_limit * candidate_multiplier,
+        )
 
     def _evaluate_candidate(
         self,
