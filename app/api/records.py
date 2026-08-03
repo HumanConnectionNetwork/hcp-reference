@@ -2,7 +2,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.core.config import API_PREFIX, RECORDS_FILE
+from app.api.dependencies import RecordServiceDependency
+from app.core.config import API_PREFIX
 from app.core.errors import (
     InvalidStorageDataError,
     RecordAlreadyExistsError,
@@ -10,17 +11,12 @@ from app.core.errors import (
     StorageError,
 )
 from app.models.humanitarian_record import HumanitarianRecord
-from app.services.records import RecordService
-from app.storage.json_store import JSONRecordStorage
 
 
 router = APIRouter(
     prefix=f"{API_PREFIX}/records",
     tags=["Humanitarian Records"],
 )
-
-storage = JSONRecordStorage(RECORDS_FILE)
-record_service = RecordService(storage)
 
 
 @router.post(
@@ -30,21 +26,31 @@ record_service = RecordService(storage)
     status_code=status.HTTP_201_CREATED,
     summary="Create a Humanitarian Record",
     description=(
-        "Validate and store one canonical Humanitarian Record in the local "
-        "HCP Reference Node."
+        "Validate and store one canonical Humanitarian Record in the "
+        "configured HCP Reference Node storage."
     ),
 )
 def create_humanitarian_record(
     record: HumanitarianRecord,
+    record_service: RecordServiceDependency,
 ) -> HumanitarianRecord:
     """
     Create and persist one canonical Humanitarian Record.
 
     The client supplies the record identifier. The reference node validates
     the complete record and rejects duplicate identifiers.
+
+    The selected storage backend is resolved by the application:
+
+        HCP_STORAGE=json
+        HCP_STORAGE=postgres
+
+    This endpoint does not depend on a concrete persistence technology.
     """
     try:
-        return record_service.create_record(record)
+        return record_service.create_record(
+            record
+        )
 
     except RecordAlreadyExistsError as exc:
         raise HTTPException(
@@ -81,11 +87,13 @@ def create_humanitarian_record(
     response_model_exclude_none=True,
     summary="Get a Humanitarian Record by ID",
     description=(
-        "Retrieve one locally stored Humanitarian Record using its UUID."
+        "Retrieve one Humanitarian Record from the configured node storage "
+        "using its UUID."
     ),
 )
 def get_humanitarian_record(
     record_id: UUID,
+    record_service: RecordServiceDependency,
 ) -> HumanitarianRecord:
     """
     Retrieve one Humanitarian Record by its record identifier.
@@ -94,7 +102,9 @@ def get_humanitarian_record(
     identify the human or animal described by the observation.
     """
     try:
-        return record_service.get_record(record_id)
+        return record_service.get_record(
+            record_id
+        )
 
     except RecordNotFoundError as exc:
         raise HTTPException(
@@ -123,4 +133,3 @@ def get_humanitarian_record(
                 "message": str(exc),
             },
         ) from exc
-
