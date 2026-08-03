@@ -16,67 +16,178 @@ from app.storage.base import RecordStorage
 
 class JSONRecordStorage(RecordStorage):
     """
-    Local JSON storage implementation for Humanitarian Records.
+    Implementación local basada en JSON.
 
-    Records are stored as a JSON array. The complete collection is loaded and
-    validated on every operation so corrupted or non-conforming persisted data
-    is never silently accepted.
+    Esta implementación permanece como almacenamiento de referencia para:
 
-    This implementation is intentionally simple and educational. Production
-    HCP Nodes may replace it with another persistence mechanism while keeping
-    the same storage contract.
+    - desarrollo local;
+    - pruebas unitarias;
+    - ejemplos educativos;
+    - migraciones hacia PostgreSQL.
+
+    Aunque la implementación de producción utilizará PostgreSQL,
+    JSONRecordStorage continúa siendo importante porque representa el
+    comportamiento esperado del contrato RecordStorage.
     """
 
-    def __init__(self, file_path: Path) -> None:
+    def __init__(
+        self,
+        file_path: Path,
+    ) -> None:
         self.file_path = file_path
 
-    def create(self, record: HumanitarianRecord) -> HumanitarianRecord:
-        """
-        Persist a new Humanitarian Record.
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-        The operation fails when the record identifier already exists.
+    def create(
+        self,
+        record: HumanitarianRecord,
+    ) -> HumanitarianRecord:
+        """
+        Persiste un Humanitarian Record.
+
+        La operación falla cuando el UUID ya existe.
         """
         records = self._load_records()
 
-        if any(existing.id == record.id for existing in records):
-            raise RecordAlreadyExistsError(str(record.id))
+        if any(
+            existing.id == record.id
+            for existing in records
+        ):
+            raise RecordAlreadyExistsError(
+                str(record.id)
+            )
 
         records.append(record)
+
         self._write_records(records)
 
         return record
 
-    def get_by_id(self, record_id: UUID) -> HumanitarianRecord:
+    def get_by_id(
+        self,
+        record_id: UUID,
+    ) -> HumanitarianRecord:
         """
-        Retrieve one Humanitarian Record by its identifier.
+        Recupera un Humanitarian Record por UUID.
         """
         for record in self._load_records():
             if record.id == record_id:
                 return record
 
-        raise RecordNotFoundError(str(record_id))
+        raise RecordNotFoundError(
+            str(record_id)
+        )
 
-    def list_all(self) -> list[HumanitarianRecord]:
+    def list_all(
+        self,
+    ) -> list[HumanitarianRecord]:
         """
-        Return all locally stored Humanitarian Records.
-        """
-        return list(self._load_records())
+        Devuelve todos los registros locales.
 
-    def exists(self, record_id: UUID) -> bool:
+        Se devuelve una copia independiente para impedir modificaciones
+        accidentales sobre la colección interna.
         """
-        Return whether a Humanitarian Record exists locally.
+        return list(
+            self._load_records()
+        )
+
+    def exists(
+        self,
+        record_id: UUID,
+    ) -> bool:
+        """
+        Comprueba si un UUID ya existe.
         """
         return any(
             record.id == record_id
             for record in self._load_records()
         )
 
-    def _ensure_storage_file(self) -> None:
+    def create_many(
+        self,
+        records: list[
+            HumanitarianRecord
+        ],
+    ) -> list[HumanitarianRecord]:
         """
-        Ensure that the parent directory and JSON storage file exist.
+        Persiste varios registros.
+
+        Se valida previamente que ningún UUID del lote exista ya dentro del
+        almacenamiento.
+
+        Si aparece un conflicto no se modifica el archivo.
+        """
+        current_records = (
+            self._load_records()
+        )
+
+        existing_ids = {
+            record.id
+            for record in current_records
+        }
+
+        duplicated_ids = [
+            record.id
+            for record in records
+            if record.id
+            in existing_ids
+        ]
+
+        if duplicated_ids:
+            raise RecordAlreadyExistsError(
+                str(
+                    duplicated_ids[0]
+                )
+            )
+
+        current_records.extend(
+            records
+        )
+
+        self._write_records(
+            current_records
+        )
+
+        return list(records)
+
+    def count(
+        self,
+    ) -> int:
+        """
+        Devuelve la cantidad de registros almacenados.
+        """
+        return len(
+            self._load_records()
+        )
+
+    def close(
+        self,
+    ) -> None:
+        """
+        JSON no mantiene conexiones abiertas.
+
+        El método existe únicamente para mantener compatibilidad con futuras
+        implementaciones PostgreSQL.
+        """
+        return
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_storage_file(
+        self,
+    ) -> None:
+        """
+        Garantiza la existencia del directorio y del archivo JSON.
         """
         try:
-            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.file_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
             if not self.file_path.exists():
                 self.file_path.write_text(
@@ -89,15 +200,27 @@ class JSONRecordStorage(RecordStorage):
                 f"Unable to initialize JSON storage: {self.file_path}"
             ) from exc
 
-    def _load_records(self) -> list[HumanitarianRecord]:
+    def _load_records(
+        self,
+    ) -> list[HumanitarianRecord]:
         """
-        Load and validate every persisted Humanitarian Record.
+        Carga y valida completamente el almacenamiento.
+
+        Ningún documento persistido se devuelve sin pasar nuevamente por la
+        validación del modelo HumanitarianRecord.
         """
         self._ensure_storage_file()
 
         try:
-            raw_content = self.file_path.read_text(encoding="utf-8")
-            raw_data = json.loads(raw_content)
+            raw_content = (
+                self.file_path.read_text(
+                    encoding="utf-8",
+                )
+            )
+
+            raw_data = json.loads(
+                raw_content
+            )
 
         except json.JSONDecodeError as exc:
             raise InvalidStorageDataError(
@@ -109,22 +232,34 @@ class JSONRecordStorage(RecordStorage):
                 f"Unable to read JSON storage: {self.file_path}"
             ) from exc
 
-        if not isinstance(raw_data, list):
+        if not isinstance(
+            raw_data,
+            list,
+        ):
             raise InvalidStorageDataError(
                 "JSON storage root must be an array of Humanitarian Records"
             )
 
-        records: list[HumanitarianRecord] = []
+        validated_records: list[
+            HumanitarianRecord
+        ] = []
 
-        for index, item in enumerate(raw_data):
-            if not isinstance(item, dict):
+        for index, item in enumerate(
+            raw_data
+        ):
+            if not isinstance(
+                item,
+                dict,
+            ):
                 raise InvalidStorageDataError(
                     f"Stored item at index {index} must be a JSON object"
                 )
 
             try:
-                records.append(
-                    HumanitarianRecord.model_validate(item)
+                validated_records.append(
+                    HumanitarianRecord.model_validate(
+                        item
+                    )
                 )
 
             except ValidationError as exc:
@@ -132,14 +267,19 @@ class JSONRecordStorage(RecordStorage):
                     f"Invalid Humanitarian Record at storage index {index}"
                 ) from exc
 
-        return records
+        return validated_records
 
     def _write_records(
         self,
-        records: list[HumanitarianRecord],
+        records: list[
+            HumanitarianRecord
+        ],
     ) -> None:
         """
-        Atomically replace the JSON storage file with validated records.
+        Sustituye completamente el archivo utilizando escritura atómica.
+
+        Primero escribe un archivo temporal y posteriormente reemplaza el
+        archivo original.
         """
         self._ensure_storage_file()
 
@@ -151,8 +291,10 @@ class JSONRecordStorage(RecordStorage):
             for record in records
         ]
 
-        temporary_path = self.file_path.with_suffix(
-            f"{self.file_path.suffix}.tmp"
+        temporary_path = (
+            self.file_path.with_suffix(
+                f"{self.file_path.suffix}.tmp"
+            )
         )
 
         try:
@@ -166,15 +308,18 @@ class JSONRecordStorage(RecordStorage):
                 encoding="utf-8",
             )
 
-            temporary_path.replace(self.file_path)
+            temporary_path.replace(
+                self.file_path
+            )
 
         except OSError as exc:
             try:
-                temporary_path.unlink(missing_ok=True)
+                temporary_path.unlink(
+                    missing_ok=True
+                )
             except OSError:
                 pass
 
             raise StorageError(
                 f"Unable to write JSON storage: {self.file_path}"
             ) from exc
-
