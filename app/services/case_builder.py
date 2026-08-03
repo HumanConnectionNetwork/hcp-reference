@@ -28,16 +28,18 @@ class HumanitarianCaseBuilder:
 
     - no confirma identidad;
     - no modifica los registros originales;
-    - no mezcla automáticamente todos los candidatos;
-    - contiene únicamente registros suficientemente compatibles entre sí;
-    - presenta una secuencia temporal local para revisión humana.
+    - conserva candidatos con compatibilidad absoluta suficientemente alta;
+    - excluye resultados débiles o espacialmente incompatibles;
+    - presenta reportes relacionados para revisión humana;
+    - no interpreta automáticamente que todos pertenezcan a una identidad.
     """
 
-    # Un candidato secundario debe permanecer cerca del principal.
-    MAX_SCORE_GAP = 12.0
+    # Compatibilidad mínima absoluta para mostrar un reporte relacionado.
+    MIN_RELATED_SCORE = 70.0
 
-    # Un registro secundario débil no debe formar parte de la misma historia.
-    MIN_RELATED_SCORE = 60.0
+    # El candidato principal siempre se conserva aunque quede por debajo del
+    # umbral, porque representa el mejor resultado disponible.
+    PRIMARY_RESULT_ALWAYS_INCLUDED = True
 
     DESCRIPTIVE_FIELDS = {
         "subject.reported_label",
@@ -54,10 +56,16 @@ class HumanitarianCaseBuilder:
         "observation.declared_location.locality",
     }
 
-    SECONDARY_SPATIAL_FIELDS = {
-        "observation.declared_location.admin_level_2",
-        "observation.declared_location.district",
-        "observation.reported_location",
+    NAME_FIELD = "subject.reported_label"
+    AGE_FIELD = "subject.estimated_age"
+    FEATURES_FIELD = "subject.recognition_features"
+
+    ANIMAL_IDENTITY_FIELDS = {
+        "subject.reported_label",
+        "subject.species",
+        "subject.size",
+        "subject.breed",
+        "subject.recognition_features",
     }
 
     SUPPORTING_STATUSES = {
@@ -72,15 +80,19 @@ class HumanitarianCaseBuilder:
         records: list[HumanitarianRecord],
     ) -> HumanitarianCase:
         """
-        Construye un caso principal con registros realmente relacionados.
+        Construye la respuesta principal de búsqueda.
 
-        El resultado de mayor puntuación se utiliza como candidato principal.
-        Los demás resultados solo se incorporan cuando:
+        El resultado con mayor compatibilidad se utiliza como caso principal.
 
-        - superan el umbral mínimo;
-        - están suficientemente cerca del candidato principal;
-        - comparten contexto espacial;
-        - aportan al menos una señal descriptiva útil.
+        Otros resultados también se conservan cuando:
+
+        - alcanzan una compatibilidad absoluta alta;
+        - comparten el contexto espacial principal;
+        - tienen suficientes señales descriptivas;
+        - no dependen únicamente de una coincidencia genérica.
+
+        Esto permite mostrar, por ejemplo, tanto Maria Rita como Maria Atencio
+        cuando ambas son casos altamente compatibles con la búsqueda.
         """
         if not results:
             raise CorrelationProcessingError(
@@ -109,7 +121,8 @@ class HumanitarianCaseBuilder:
             )
 
             selected_results = self._select_case_results(
-                ordered_results
+                query=query,
+                ordered_results=ordered_results,
             )
 
             strongest_result = selected_results[0]
@@ -201,22 +214,22 @@ class HumanitarianCaseBuilder:
 
     def _select_case_results(
         self,
+        query: HumanitarianQuery,
         ordered_results: list[CorrelationResult],
     ) -> list[CorrelationResult]:
         """
-        Selecciona los registros que realmente forman la historia principal.
+        Selecciona todos los candidatos altamente compatibles.
 
-        El mejor candidato siempre se conserva.
+        Ya no se utiliza una diferencia máxima respecto al candidato principal.
 
-        Un candidato adicional debe:
+        Un candidato secundario entra cuando:
 
-        - tener al menos 60 puntos;
-        - estar a no más de 12 puntos del principal;
-        - compartir evidencia espacial principal;
-        - aportar una señal descriptiva compatible.
+        - tiene al menos MIN_RELATED_SCORE;
+        - comparte evidencia espacial principal;
+        - presenta suficientes datos descriptivos compatibles.
 
-        Esto evita que varios registros lejanos o genéricos sean presentados
-        como si pertenecieran automáticamente a una misma persona o animal.
+        Así, un resultado de 78% no se elimina solo porque el principal obtuvo
+        92%.
         """
         strongest_result = ordered_results[0]
 
@@ -225,20 +238,9 @@ class HumanitarianCaseBuilder:
         ]
 
         for result in ordered_results[1:]:
-            score_gap = (
-                strongest_result.score
-                - result.score
-            )
-
             if (
                 result.score
                 < self.MIN_RELATED_SCORE
-            ):
-                continue
-
-            if (
-                score_gap
-                > self.MAX_SCORE_GAP
             ):
                 continue
 
@@ -247,8 +249,9 @@ class HumanitarianCaseBuilder:
             ):
                 continue
 
-            if not self._has_descriptive_support(
-                result
+            if not self._has_sufficient_subject_support(
+                query=query,
+                result=result,
             ):
                 continue
 
@@ -264,16 +267,24 @@ class HumanitarianCaseBuilder:
         result: CorrelationResult,
     ) -> bool:
         """
-        Exige compatibilidad geográfica estructural.
+        Exige compatibilidad en el contexto geográfico principal.
 
-        Para registros HCP 0.6 se requiere evidencia compatible en:
+        Para registros HCP 0.6 se consideran:
 
         - país;
         - estado, provincia o región;
         - ciudad o localidad.
 
-        Para registros antiguos 0.5 se acepta una ubicación libre compatible.
+        El municipio y el barrio son señales secundarias y sus diferencias no
+        excluyen automáticamente el resultado.
+
+        Para registros HCP 0.5 se admite la ubicación libre compatible.
         """
+        all_fields = {
+            signal.field
+            for signal in result.signals
+        }
+
         supporting_fields = {
             signal.field
             for signal in result.signals
@@ -287,18 +298,18 @@ class HumanitarianCaseBuilder:
         ):
             return True
 
-        required_fields_present = (
-            cls.PRIMARY_SPATIAL_FIELDS
-            & {
-                signal.field
-                for signal in result.signals
-            }
+        present_primary_fields = (
+            all_fields
+            & cls.PRIMARY_SPATIAL_FIELDS
         )
 
-        # Si la consulta realmente produjo las tres señales espaciales,
-        # deben ser compatibles para formar parte de la misma historia.
+        if not present_primary_fields:
+            return False
+
+        # Si existen las tres señales estructuradas, las tres deben apoyar el
+        # candidato.
         if (
-            required_fields_present
+            present_primary_fields
             == cls.PRIMARY_SPATIAL_FIELDS
         ):
             return (
@@ -306,29 +317,112 @@ class HumanitarianCaseBuilder:
                 <= supporting_fields
             )
 
-        # Compatibilidad defensiva con consultas parciales o modelos antiguos.
+        # Compatibilidad defensiva con consultas o registros parcialmente
+        # estructurados.
         return len(
-            supporting_fields
-            & cls.PRIMARY_SPATIAL_FIELDS
+            present_primary_fields
+            & supporting_fields
         ) >= 2
 
     @classmethod
-    def _has_descriptive_support(
+    def _has_sufficient_subject_support(
         cls,
+        query: HumanitarianQuery,
         result: CorrelationResult,
     ) -> bool:
         """
-        Requiere al menos una evidencia descriptiva positiva.
+        Exige más que una coincidencia descriptiva genérica.
 
-        La coincidencia temporal o espacial por sí sola no es suficiente para
-        incorporar un registro a la historia principal.
+        Personas:
+        - nombre compatible; y
+        - edad o características compatibles cuando fueron consultadas.
+
+        Animales:
+        - al menos dos señales entre nombre, especie, raza, tamaño y
+          características.
+
+        Esto evita que una sola palabra común incorpore registros irrelevantes.
         """
-        return any(
+        supporting_fields = {
             signal.field
-            in cls.DESCRIPTIVE_FIELDS
-            and signal.status
-            in cls.SUPPORTING_STATUSES
             for signal in result.signals
+            if signal.status
+            in cls.SUPPORTING_STATUSES
+        }
+
+        if query.subject.type == "animal":
+            animal_support_count = len(
+                supporting_fields
+                & cls.ANIMAL_IDENTITY_FIELDS
+            )
+
+            return animal_support_count >= 2
+
+        query_has_name = bool(
+            getattr(
+                query.subject,
+                "reported_label",
+                None,
+            )
+        )
+
+        query_has_age = (
+            getattr(
+                query.subject,
+                "estimated_age",
+                None,
+            )
+            is not None
+        )
+
+        query_has_features = bool(
+            getattr(
+                query.subject,
+                "recognition_features",
+                None,
+            )
+        )
+
+        name_supported = (
+            cls.NAME_FIELD
+            in supporting_fields
+        )
+
+        age_supported = (
+            cls.AGE_FIELD
+            in supporting_fields
+        )
+
+        features_supported = (
+            cls.FEATURES_FIELD
+            in supporting_fields
+        )
+
+        if query_has_name and not name_supported:
+            return False
+
+        secondary_requested = (
+            query_has_age
+            or query_has_features
+        )
+
+        if not secondary_requested:
+            return name_supported
+
+        secondary_supported = (
+            (
+                query_has_age
+                and age_supported
+            )
+            or (
+                query_has_features
+                and features_supported
+            )
+        )
+
+        return (
+            name_supported
+            and secondary_supported
         )
 
     @staticmethod
@@ -394,10 +488,10 @@ class HumanitarianCaseBuilder:
         ],
     ) -> HumanitarianRecord:
         """
-        Devuelve el registro relacionado más reciente.
+        Devuelve el reporte seleccionado más reciente.
 
-        La situación actual probable debe derivarse del registro más reciente,
-        no necesariamente del registro con mayor compatibilidad.
+        La situación probable se deriva del reporte más reciente dentro del
+        conjunto de casos altamente compatibles.
         """
         return max(
             (
@@ -420,7 +514,7 @@ class HumanitarianCaseBuilder:
         ],
     ) -> list[RelatedRecord]:
         """
-        Construye referencias únicamente a los registros seleccionados.
+        Construye referencias a todos los reportes altamente compatibles.
         """
         return [
             RelatedRecord(
@@ -454,10 +548,11 @@ class HumanitarianCaseBuilder:
         ],
     ) -> list[TimelineEntry]:
         """
-        Construye la Historia del caso en orden cronológico.
+        Construye la lista cronológica de reportes altamente compatibles.
 
-        La ubicación estructurada HCP 0.6 se convierte temporalmente en texto
-        porque TimelineEntry todavía expone `reported_location`.
+        En esta etapa, la lista puede contener más de un posible caso. La
+        interfaz debe presentar cada reporte con acceso independiente mediante
+        su ID y no afirmar que todos representan una sola identidad.
         """
         timeline = [
             TimelineEntry(
@@ -503,10 +598,7 @@ class HumanitarianCaseBuilder:
         ],
     ) -> list[EvidenceItem]:
         """
-        Convierte señales seleccionadas en evidencia explicable del caso.
-
-        Solo se incluye evidencia perteneciente a los registros que realmente
-        forman la historia principal.
+        Convierte señales de los reportes seleccionados en evidencia explicable.
         """
         evidence: list[EvidenceItem] = []
 
@@ -560,7 +652,7 @@ class HumanitarianCaseBuilder:
         ],
     ) -> str:
         """
-        Explica por qué algunos candidatos entraron en la historia y otros no.
+        Explica la selección por compatibilidad absoluta.
         """
         strongest_result = (
             selected_results[0]
@@ -591,23 +683,24 @@ class HumanitarianCaseBuilder:
             f"The local search evaluated {all_result_count} correlated "
             f"candidate"
             f"{'' if all_result_count == 1 else 's'}. "
-            f"{len(selected_results)} record"
+            f"{len(selected_results)} report"
             f"{'' if len(selected_results) == 1 else 's'} "
-            "were retained in the primary Humanitarian Case because they "
-            "shared sufficiently close spatial and descriptive evidence. "
-            f"The strongest candidate received a compatibility score of "
+            "were retained because they reached the absolute compatibility "
+            "threshold and shared sufficient spatial and descriptive "
+            "evidence. "
+            f"The strongest result received a compatibility score of "
             f"{strongest_result.score:.2f} and an evidence strength level "
             f"of '{strongest_result.confidence.value}'. "
-            f"The selected case contains {supporting_signal_count} "
+            f"The retained results contain {supporting_signal_count} "
             f"supporting signal"
             f"{'' if supporting_signal_count == 1 else 's'} and "
             f"{conflicting_signal_count} conflicting signal"
             f"{'' if conflicting_signal_count == 1 else 's'}. "
-            f"{excluded_count} weaker or structurally different candidate"
+            f"{excluded_count} weaker or structurally incompatible candidate"
             f"{'' if excluded_count == 1 else 's'} "
-            "were not incorporated into this case history. "
-            "This interpretation expresses compatibility and does not "
-            "establish identity."
+            "were excluded. "
+            "The retained reports are possible related cases and must not be "
+            "assumed to represent one confirmed identity."
         )
 
     @classmethod
@@ -620,7 +713,7 @@ class HumanitarianCaseBuilder:
         strongest_record: HumanitarianRecord,
     ) -> str:
         """
-        Resume el caso principal desde el registro más compatible.
+        Resume el conjunto de casos altamente compatibles.
         """
         location = (
             cls._record_location_text(
@@ -646,15 +739,21 @@ class HumanitarianCaseBuilder:
             else ""
         )
 
+        case_word = (
+            "case"
+            if len(selected_results) == 1
+            else "cases"
+        )
+
         return (
-            f"A primary related case was identified from "
-            f"{len(selected_results)} Humanitarian Record"
-            f"{'' if len(selected_results) == 1 else 's'}. "
+            f"{len(selected_results)} highly compatible related {case_word} "
+            "were identified. "
             f"The strongest report{subject_text} describes a "
             f"'{strongest_record.observation.event_type}' situation"
             f"{location_text}, with a compatibility score of "
             f"{strongest_result.score:.2f}. "
-            "The result requires human verification."
+            "Each report must be reviewed independently and the result "
+            "requires human verification."
         )
 
     @staticmethod
@@ -712,8 +811,6 @@ class HumanitarianCaseBuilder:
                 if not normalized_value:
                     continue
 
-                # Evita duplicados consecutivos como:
-                # Cabimas, Cabimas, Zulia, VE.
                 if (
                     normalized_values
                     and normalized_values[-1].casefold()
