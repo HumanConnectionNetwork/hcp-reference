@@ -3,7 +3,12 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.core.config import API_PREFIX, RECORDS_FILE
+from app.api.dependencies import (
+    CaseBuilderDependency,
+    CorrelationServiceDependency,
+    SearchServiceDependency,
+)
+from app.core.config import API_PREFIX
 from app.core.errors import (
     CorrelationProcessingError,
     InvalidStorageDataError,
@@ -12,22 +17,12 @@ from app.core.errors import (
 )
 from app.models.humanitarian_case import HumanitarianCase
 from app.models.query import HumanitarianQuery
-from app.services.case_builder import HumanitarianCaseBuilder
-from app.services.correlation import CorrelationService
-from app.services.search import SearchService
-from app.storage.json_store import JSONRecordStorage
 
 
 router = APIRouter(
     prefix=f"{API_PREFIX}/search",
     tags=["Search"],
 )
-
-storage = JSONRecordStorage(RECORDS_FILE)
-
-search_service = SearchService(storage)
-correlation_service = CorrelationService()
-case_builder = HumanitarianCaseBuilder()
 
 
 class SearchResponse(BaseModel):
@@ -69,14 +64,17 @@ class SearchResponse(BaseModel):
     response_model_exclude_none=True,
     summary="Search and correlate Humanitarian Records",
     description=(
-        "Search locally stored Humanitarian Records using a structured HCP "
-        "Query, calculate explainable correlation results and build a local "
-        "Humanitarian Case when compatible evidence is found. The resulting "
-        "case is probabilistic and does not confirm identity."
+        "Search Humanitarian Records using a structured HCP Query, calculate "
+        "explainable correlation results and build a local Humanitarian Case "
+        "when compatible evidence is found. The resulting case is "
+        "probabilistic and does not confirm identity."
     ),
 )
 def search_humanitarian_records(
     humanitarian_query: HumanitarianQuery,
+    search_service: SearchServiceDependency,
+    correlation_service: CorrelationServiceDependency,
+    case_builder: CaseBuilderDependency,
     limit: Annotated[
         int | None,
         Query(
@@ -101,13 +99,16 @@ def search_humanitarian_records(
     ] = 0.0,
 ) -> SearchResponse:
     """
-    Search, correlate and interpret local Humanitarian Records.
+    Search, correlate and interpret Humanitarian Records.
 
     Processing sequence:
 
-    1. SearchService selects broad candidates.
+    1. SearchService selects broad candidates from the configured storage.
     2. CorrelationService evaluates compatibility with the Query.
-    3. HumanitarianCaseBuilder creates a local explainable interpretation.
+    3. HumanitarianCaseBuilder creates an explainable interpretation.
+
+    The configured storage may be JSON or PostgreSQL. This endpoint does not
+    depend on a concrete persistence technology.
 
     The returned Humanitarian Case does not establish identity and always
     requires human verification.
@@ -126,17 +127,21 @@ def search_humanitarian_records(
                 humanitarian_case=None,
             )
 
-        correlation_results = correlation_service.correlate_records(
-            query=humanitarian_query,
-            records=candidate_records,
-            limit=limit,
-            minimum_score=minimum_score,
+        correlation_results = (
+            correlation_service.correlate_records(
+                query=humanitarian_query,
+                records=candidate_records,
+                limit=limit,
+                minimum_score=minimum_score,
+            )
         )
 
         if not correlation_results:
             return SearchResponse(
                 query=humanitarian_query,
-                candidate_count=len(candidate_records),
+                candidate_count=len(
+                    candidate_records
+                ),
                 correlated_count=0,
                 humanitarian_case=None,
             )
@@ -149,52 +154,75 @@ def search_humanitarian_records(
         correlated_records = [
             record
             for record in candidate_records
-            if record.id in correlated_record_ids
+            if record.id
+            in correlated_record_ids
         ]
 
-        humanitarian_case = case_builder.build(
-            query=humanitarian_query,
-            results=correlation_results,
-            records=correlated_records,
+        humanitarian_case = (
+            case_builder.build(
+                query=humanitarian_query,
+                results=correlation_results,
+                records=correlated_records,
+            )
         )
 
         return SearchResponse(
             query=humanitarian_query,
-            candidate_count=len(candidate_records),
-            correlated_count=len(correlation_results),
-            humanitarian_case=humanitarian_case,
+            candidate_count=len(
+                candidate_records
+            ),
+            correlated_count=len(
+                correlation_results
+            ),
+            humanitarian_case=(
+                humanitarian_case
+            ),
         )
 
     except QueryProcessingError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=(
+                status.HTTP_400_BAD_REQUEST
+            ),
             detail={
-                "code": "query_processing_error",
+                "code": (
+                    "query_processing_error"
+                ),
                 "message": str(exc),
             },
         ) from exc
 
     except CorrelationProcessingError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_CONTENT
+            ),
             detail={
-                "code": "correlation_processing_error",
+                "code": (
+                    "correlation_processing_error"
+                ),
                 "message": str(exc),
             },
         ) from exc
 
     except InvalidStorageDataError as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=(
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            ),
             detail={
-                "code": "invalid_storage_data",
+                "code": (
+                    "invalid_storage_data"
+                ),
                 "message": str(exc),
             },
         ) from exc
 
     except StorageError as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=(
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            ),
             detail={
                 "code": "storage_error",
                 "message": str(exc),
