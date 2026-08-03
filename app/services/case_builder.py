@@ -21,23 +21,49 @@ from app.models.query import HumanitarianQuery
 
 class HumanitarianCaseBuilder:
     """
-    Build one local Humanitarian Case from correlated Humanitarian Records.
+    Construye una interpretación humanitaria local a partir de resultados
+    de correlación.
 
-    Public clients may present the resulting object as:
+    Un Humanitarian Case:
 
-    - Caso relacionado;
-    - Historia del caso;
-    - Reportes del caso.
-
-    The builder organizes the interpretation around:
-
-    1. space;
-    2. time;
-    3. description.
-
-    It preserves traceability to every original Humanitarian Record and does
-    not establish identity.
+    - no confirma identidad;
+    - no modifica los registros originales;
+    - no mezcla automáticamente todos los candidatos;
+    - contiene únicamente registros suficientemente compatibles entre sí;
+    - presenta una secuencia temporal local para revisión humana.
     """
+
+    # Un candidato secundario debe permanecer cerca del principal.
+    MAX_SCORE_GAP = 12.0
+
+    # Un registro secundario débil no debe formar parte de la misma historia.
+    MIN_RELATED_SCORE = 60.0
+
+    DESCRIPTIVE_FIELDS = {
+        "subject.reported_label",
+        "subject.estimated_age",
+        "subject.recognition_features",
+        "subject.species",
+        "subject.size",
+        "subject.breed",
+    }
+
+    PRIMARY_SPATIAL_FIELDS = {
+        "observation.declared_location.country_code",
+        "observation.declared_location.admin_level_1",
+        "observation.declared_location.locality",
+    }
+
+    SECONDARY_SPATIAL_FIELDS = {
+        "observation.declared_location.admin_level_2",
+        "observation.declared_location.district",
+        "observation.reported_location",
+    }
+
+    SUPPORTING_STATUSES = {
+        CorrelationSignalStatus.MATCH,
+        CorrelationSignalStatus.PARTIAL_MATCH,
+    }
 
     def build(
         self,
@@ -46,15 +72,15 @@ class HumanitarianCaseBuilder:
         records: list[HumanitarianRecord],
     ) -> HumanitarianCase:
         """
-        Build one probable case history.
+        Construye un caso principal con registros realmente relacionados.
 
-        The strongest correlation result provides the displayed compatibility.
+        El resultado de mayor puntuación se utiliza como candidato principal.
+        Los demás resultados solo se incorporan cuando:
 
-        The most recent related record provides the current situation.
-
-        Raises:
-            CorrelationProcessingError:
-                If no results exist or the supplied records are inconsistent.
+        - superan el umbral mínimo;
+        - están suficientemente cerca del candidato principal;
+        - comparten contexto espacial;
+        - aportan al menos una señal descriptiva útil.
         """
         if not results:
             raise CorrelationProcessingError(
@@ -67,8 +93,13 @@ class HumanitarianCaseBuilder:
                 for record in records
             }
 
-            ordered_results = self._order_results(
-                results
+            ordered_results = sorted(
+                results,
+                key=lambda result: (
+                    result.score,
+                    self._supporting_signal_count(result),
+                ),
+                reverse=True,
             )
 
             self._validate_inputs(
@@ -77,74 +108,75 @@ class HumanitarianCaseBuilder:
                 records_by_id=records_by_id,
             )
 
-            strongest_result = ordered_results[0]
+            selected_results = self._select_case_results(
+                ordered_results
+            )
 
+            strongest_result = selected_results[0]
             strongest_record = records_by_id[
                 strongest_result.record_id
             ]
 
             latest_record = self._latest_record(
-                results=ordered_results,
+                results=selected_results,
                 records_by_id=records_by_id,
             )
 
             related_records = self._build_related_records(
-                results=ordered_results,
+                results=selected_results,
                 records_by_id=records_by_id,
             )
 
             timeline = self._build_timeline(
-                results=ordered_results,
+                results=selected_results,
                 records_by_id=records_by_id,
             )
 
             supporting_evidence = self._build_evidence(
-                results=ordered_results,
-                status_group={
-                    CorrelationSignalStatus.MATCH,
-                    CorrelationSignalStatus.PARTIAL_MATCH,
-                },
+                results=selected_results,
+                status_group=self.SUPPORTING_STATUSES,
             )
 
             conflicting_evidence = self._build_evidence(
-                results=ordered_results,
+                results=selected_results,
                 status_group={
                     CorrelationSignalStatus.CONFLICT,
                 },
             )
 
+            reasoning = self._build_reasoning(
+                all_result_count=len(ordered_results),
+                selected_results=selected_results,
+            )
+
             return HumanitarianCase(
-                source_query_id=self._source_query_id(
-                    query
-                ),
+                source_query_id=self._source_query_id(query),
                 humanitarian_summary=self._build_summary(
-                    result_count=len(
-                        ordered_results
-                    ),
+                    selected_results=selected_results,
                     strongest_result=strongest_result,
-                    latest_record=latest_record,
+                    strongest_record=strongest_record,
                 ),
-                current_situation=self._build_current_situation(
-                    latest_record
+                current_situation=CurrentSituation(
+                    likely_event_type=(
+                        latest_record.observation.event_type
+                    ),
+                    reported_location=(
+                        self._record_location_text(
+                            latest_record
+                        )
+                    ),
+                    observed_at=(
+                        latest_record.observation.observed_at
+                    ),
                 ),
                 correlation=CaseCorrelation(
                     score=strongest_result.score,
                     evidence_level=(
-                        strongest_result
-                        .confidence
-                        .value
+                        strongest_result.confidence.value
                     ),
-                    supporting_evidence=(
-                        supporting_evidence
-                    ),
-                    conflicting_evidence=(
-                        conflicting_evidence
-                    ),
-                    reasoning=self._build_reasoning(
-                        results=ordered_results,
-                        strongest_record=strongest_record,
-                        latest_record=latest_record,
-                    ),
+                    supporting_evidence=supporting_evidence,
+                    conflicting_evidence=conflicting_evidence,
+                    reasoning=reasoning,
                 ),
                 related_records=related_records,
                 humanitarian_timeline=timeline,
@@ -167,23 +199,136 @@ class HumanitarianCaseBuilder:
                 "Unable to build the local Humanitarian Case"
             ) from exc
 
-    @staticmethod
-    def _order_results(
-        results: list[CorrelationResult],
+    def _select_case_results(
+        self,
+        ordered_results: list[CorrelationResult],
     ) -> list[CorrelationResult]:
         """
-        Order results by compatibility and evidence strength.
+        Selecciona los registros que realmente forman la historia principal.
+
+        El mejor candidato siempre se conserva.
+
+        Un candidato adicional debe:
+
+        - tener al menos 60 puntos;
+        - estar a no más de 12 puntos del principal;
+        - compartir evidencia espacial principal;
+        - aportar una señal descriptiva compatible.
+
+        Esto evita que varios registros lejanos o genéricos sean presentados
+        como si pertenecieran automáticamente a una misma persona o animal.
         """
-        return sorted(
-            results,
-            key=lambda result: (
-                result.score,
-                HumanitarianCaseBuilder
-                ._confidence_sort_value(
-                    result.confidence.value
-                ),
-            ),
-            reverse=True,
+        strongest_result = ordered_results[0]
+
+        selected_results = [
+            strongest_result
+        ]
+
+        for result in ordered_results[1:]:
+            score_gap = (
+                strongest_result.score
+                - result.score
+            )
+
+            if (
+                result.score
+                < self.MIN_RELATED_SCORE
+            ):
+                continue
+
+            if (
+                score_gap
+                > self.MAX_SCORE_GAP
+            ):
+                continue
+
+            if not self._has_primary_spatial_support(
+                result
+            ):
+                continue
+
+            if not self._has_descriptive_support(
+                result
+            ):
+                continue
+
+            selected_results.append(
+                result
+            )
+
+        return selected_results
+
+    @classmethod
+    def _has_primary_spatial_support(
+        cls,
+        result: CorrelationResult,
+    ) -> bool:
+        """
+        Exige compatibilidad geográfica estructural.
+
+        Para registros HCP 0.6 se requiere evidencia compatible en:
+
+        - país;
+        - estado, provincia o región;
+        - ciudad o localidad.
+
+        Para registros antiguos 0.5 se acepta una ubicación libre compatible.
+        """
+        supporting_fields = {
+            signal.field
+            for signal in result.signals
+            if signal.status
+            in cls.SUPPORTING_STATUSES
+        }
+
+        if (
+            "observation.reported_location"
+            in supporting_fields
+        ):
+            return True
+
+        required_fields_present = (
+            cls.PRIMARY_SPATIAL_FIELDS
+            & {
+                signal.field
+                for signal in result.signals
+            }
+        )
+
+        # Si la consulta realmente produjo las tres señales espaciales,
+        # deben ser compatibles para formar parte de la misma historia.
+        if (
+            required_fields_present
+            == cls.PRIMARY_SPATIAL_FIELDS
+        ):
+            return (
+                cls.PRIMARY_SPATIAL_FIELDS
+                <= supporting_fields
+            )
+
+        # Compatibilidad defensiva con consultas parciales o modelos antiguos.
+        return len(
+            supporting_fields
+            & cls.PRIMARY_SPATIAL_FIELDS
+        ) >= 2
+
+    @classmethod
+    def _has_descriptive_support(
+        cls,
+        result: CorrelationResult,
+    ) -> bool:
+        """
+        Requiere al menos una evidencia descriptiva positiva.
+
+        La coincidencia temporal o espacial por sí sola no es suficiente para
+        incorporar un registro a la historia principal.
+        """
+        return any(
+            signal.field
+            in cls.DESCRIPTIVE_FIELDS
+            and signal.status
+            in cls.SUPPORTING_STATUSES
+            for signal in result.signals
         )
 
     @staticmethod
@@ -196,14 +341,17 @@ class HumanitarianCaseBuilder:
         ],
     ) -> None:
         """
-        Validate consistency among Query, results and source records.
+        Valida consistencia entre consulta, resultados y registros.
         """
         result_ids = [
             result.record_id
             for result in results
         ]
 
-        if len(result_ids) != len(set(result_ids)):
+        if (
+            len(result_ids)
+            != len(set(result_ids))
+        ):
             raise CorrelationProcessingError(
                 "Correlation results must not contain duplicate record "
                 "identifiers"
@@ -246,54 +394,20 @@ class HumanitarianCaseBuilder:
         ],
     ) -> HumanitarianRecord:
         """
-        Return the most recent correlated Humanitarian Record.
+        Devuelve el registro relacionado más reciente.
+
+        La situación actual probable debe derivarse del registro más reciente,
+        no necesariamente del registro con mayor compatibilidad.
         """
-        related_records = [
-            records_by_id[result.record_id]
-            for result in results
-        ]
-
-        if not related_records:
-            raise CorrelationProcessingError(
-                "Unable to determine the latest related report"
-            )
-
         return max(
-            related_records,
+            (
+                records_by_id[
+                    result.record_id
+                ]
+                for result in results
+            ),
             key=lambda record: (
                 record.observation.observed_at
-            ),
-        )
-
-    @staticmethod
-    def _build_current_situation(
-        latest_record: HumanitarianRecord,
-    ) -> CurrentSituation:
-        """
-        Build the current known situation from the latest related report.
-
-        Structured location is preserved directly. Legacy free text remains
-        available for schema 0.5 clients.
-        """
-        observation = (
-            latest_record.observation
-        )
-
-        return CurrentSituation(
-            likely_event_type=(
-                observation.event_type
-            ),
-            declared_location=(
-                observation.declared_location
-            ),
-            reported_location=(
-                observation.reported_location
-            ),
-            observed_at=(
-                observation.observed_at
-            ),
-            source_record_id=(
-                latest_record.id
             ),
         )
 
@@ -306,58 +420,33 @@ class HumanitarianCaseBuilder:
         ],
     ) -> list[RelatedRecord]:
         """
-        Build compact references to reports included in the case.
-
-        Each reference carries enough information for a public client to show:
-
-        - event;
-        - location;
-        - time;
-        - whether a public contact exists;
-        - the record identifier needed to open the full report.
+        Construye referencias únicamente a los registros seleccionados.
         """
-        related_records: list[
-            RelatedRecord
-        ] = []
-
-        for result in results:
-            record = records_by_id[
-                result.record_id
-            ]
-
-            observation = (
-                record.observation
+        return [
+            RelatedRecord(
+                record_id=result.record_id,
+                event_type=(
+                    records_by_id[
+                        result.record_id
+                    ].observation.event_type
+                ),
+                observed_at=(
+                    records_by_id[
+                        result.record_id
+                    ].observation.observed_at
+                ),
+                source=(
+                    records_by_id[
+                        result.record_id
+                    ].source_client
+                ),
             )
+            for result in results
+        ]
 
-            related_records.append(
-                RelatedRecord(
-                    record_id=record.id,
-                    event_type=(
-                        observation.event_type
-                    ),
-                    observed_at=(
-                        observation.observed_at
-                    ),
-                    declared_location=(
-                        observation.declared_location
-                    ),
-                    reported_location=(
-                        observation.reported_location
-                    ),
-                    source=(
-                        record.source_client
-                    ),
-                    public_contact_available=(
-                        observation.public_contact
-                        is not None
-                    ),
-                )
-            )
-
-        return related_records
-
-    @staticmethod
+    @classmethod
     def _build_timeline(
+        cls,
         results: list[CorrelationResult],
         records_by_id: dict[
             UUID,
@@ -365,46 +454,38 @@ class HumanitarianCaseBuilder:
         ],
     ) -> list[TimelineEntry]:
         """
-        Build the chronological history of reports included in the case.
+        Construye la Historia del caso en orden cronológico.
+
+        La ubicación estructurada HCP 0.6 se convierte temporalmente en texto
+        porque TimelineEntry todavía expone `reported_location`.
         """
-        timeline: list[
-            TimelineEntry
-        ] = []
-
-        for result in results:
-            record = records_by_id[
-                result.record_id
-            ]
-
-            observation = (
-                record.observation
+        timeline = [
+            TimelineEntry(
+                record_id=result.record_id,
+                event_type=(
+                    records_by_id[
+                        result.record_id
+                    ].observation.event_type
+                ),
+                observed_at=(
+                    records_by_id[
+                        result.record_id
+                    ].observation.observed_at
+                ),
+                reported_location=(
+                    cls._record_location_text(
+                        records_by_id[
+                            result.record_id
+                        ]
+                    )
+                ),
+                description=(
+                    "Humanitarian report contributed by "
+                    f"{records_by_id[result.record_id].source_client}."
+                ),
             )
-
-            timeline.append(
-                TimelineEntry(
-                    record_id=record.id,
-                    event_type=(
-                        observation.event_type
-                    ),
-                    observed_at=(
-                        observation.observed_at
-                    ),
-                    declared_location=(
-                        observation.declared_location
-                    ),
-                    reported_location=(
-                        observation.reported_location
-                    ),
-                    description=(
-                        "Humanitarian report contributed by "
-                        f"{record.source_client}."
-                    ),
-                    public_contact_available=(
-                        observation.public_contact
-                        is not None
-                    ),
-                )
-            )
+            for result in results
+        ]
 
         timeline.sort(
             key=lambda entry: (
@@ -422,14 +503,12 @@ class HumanitarianCaseBuilder:
         ],
     ) -> list[EvidenceItem]:
         """
-        Convert correlation signals into case-level evidence.
+        Convierte señales seleccionadas en evidencia explicable del caso.
 
-        NOT_AVAILABLE signals are excluded because missing information is not
-        a contradiction.
+        Solo se incluye evidencia perteneciente a los registros que realmente
+        forman la historia principal.
         """
-        evidence: list[
-            EvidenceItem
-        ] = []
+        evidence: list[EvidenceItem] = []
 
         for result in results:
             for signal in result.signals:
@@ -460,14 +539,11 @@ class HumanitarianCaseBuilder:
         signal: CorrelationSignal,
     ) -> str:
         """
-        Convert one correlation signal into a canonical evidence token.
+        Convierte el campo comparado en un token canónico.
         """
         field_token = (
             signal.field
-            .replace(
-                ".",
-                "_",
-            )
+            .replace(".", "_")
         )
 
         return (
@@ -478,273 +554,212 @@ class HumanitarianCaseBuilder:
     @classmethod
     def _build_reasoning(
         cls,
-        results: list[CorrelationResult],
-        strongest_record: HumanitarianRecord,
-        latest_record: HumanitarianRecord,
+        all_result_count: int,
+        selected_results: list[
+            CorrelationResult
+        ],
     ) -> str:
         """
-        Explain how the probable case history was built.
+        Explica por qué algunos candidatos entraron en la historia y otros no.
         """
-        strongest_result = results[0]
-
-        signal_counts = cls._count_signals(
-            results
+        strongest_result = (
+            selected_results[0]
         )
 
-        evidence_groups = (
-            cls._count_evidence_groups(
-                strongest_result.signals
-            )
+        supporting_signal_count = sum(
+            1
+            for result in selected_results
+            for signal in result.signals
+            if signal.status
+            in cls.SUPPORTING_STATUSES
         )
 
-        strongest_location = (
-            strongest_record
-            .observation
-            .location_display_text()
+        conflicting_signal_count = sum(
+            1
+            for result in selected_results
+            for signal in result.signals
+            if signal.status
+            == CorrelationSignalStatus.CONFLICT
         )
 
-        latest_location = (
-            latest_record
-            .observation
-            .location_display_text()
+        excluded_count = (
+            all_result_count
+            - len(selected_results)
         )
-
-        location_context = (
-            cls._location_context_sentence(
-                strongest_location=strongest_location,
-                latest_location=latest_location,
-            )
-        )
-
-        event_context = (
-            cls._event_context_sentence(
-                strongest_record=strongest_record,
-                latest_record=latest_record,
-            )
-        )
-
-        unavailable_context = ""
-
-        if signal_counts["unavailable"] > 0:
-            unavailable_context = (
-                f" {signal_counts['unavailable']} requested evidence "
-                f"field"
-                f"{'' if signal_counts['unavailable'] == 1 else 's'} "
-                "were unavailable in the related reports."
-            )
 
         return (
-            f"The case was built from {len(results)} related Humanitarian "
-            f"Record"
-            f"{'' if len(results) == 1 else 's'}. "
-            f"The strongest report received a compatibility score of "
+            f"The local search evaluated {all_result_count} correlated "
+            f"candidate"
+            f"{'' if all_result_count == 1 else 's'}. "
+            f"{len(selected_results)} record"
+            f"{'' if len(selected_results) == 1 else 's'} "
+            "were retained in the primary Humanitarian Case because they "
+            "shared sufficiently close spatial and descriptive evidence. "
+            f"The strongest candidate received a compatibility score of "
             f"{strongest_result.score:.2f} and an evidence strength level "
             f"of '{strongest_result.confidence.value}'. "
-            f"The strongest result contains "
-            f"{evidence_groups['space']} spatial, "
-            f"{evidence_groups['time']} temporal and "
-            f"{evidence_groups['description']} descriptive signal"
-            f"{'' if evidence_groups['description'] == 1 else 's'}. "
-            f"Across all related reports there are "
-            f"{signal_counts['supporting']} supporting signal"
-            f"{'' if signal_counts['supporting'] == 1 else 's'} and "
-            f"{signal_counts['conflicting']} conflicting signal"
-            f"{'' if signal_counts['conflicting'] == 1 else 's'}."
-            f"{unavailable_context} "
-            f"{location_context} "
-            f"{event_context} "
-            "This probable history expresses continuity between reports and "
-            "does not establish identity."
+            f"The selected case contains {supporting_signal_count} "
+            f"supporting signal"
+            f"{'' if supporting_signal_count == 1 else 's'} and "
+            f"{conflicting_signal_count} conflicting signal"
+            f"{'' if conflicting_signal_count == 1 else 's'}. "
+            f"{excluded_count} weaker or structurally different candidate"
+            f"{'' if excluded_count == 1 else 's'} "
+            "were not incorporated into this case history. "
+            "This interpretation expresses compatibility and does not "
+            "establish identity."
         )
 
-    @staticmethod
+    @classmethod
     def _build_summary(
-        result_count: int,
+        cls,
+        selected_results: list[
+            CorrelationResult
+        ],
         strongest_result: CorrelationResult,
-        latest_record: HumanitarianRecord,
+        strongest_record: HumanitarianRecord,
     ) -> str:
         """
-        Build a concise summary centered on the latest useful report.
+        Resume el caso principal desde el registro más compatible.
         """
-        observation = (
-            latest_record.observation
-        )
-
-        latest_location = (
-            observation
-            .location_display_text()
+        location = (
+            cls._record_location_text(
+                strongest_record
+            )
         )
 
         location_text = (
-            f" in {latest_location}"
-            if latest_location
+            f" in {location}"
+            if location
+            else ""
+        )
+
+        subject_label = (
+            strongest_record
+            .subject
+            .reported_label
+        )
+
+        subject_text = (
+            f" describing '{subject_label}'"
+            if subject_label
             else ""
         )
 
         return (
-            f"{result_count} related Humanitarian Record"
-            f"{'' if result_count == 1 else 's'} were identified. "
-            f"The strongest report has a compatibility score of "
+            f"A primary related case was identified from "
+            f"{len(selected_results)} Humanitarian Record"
+            f"{'' if len(selected_results) == 1 else 's'}. "
+            f"The strongest report{subject_text} describes a "
+            f"'{strongest_record.observation.event_type}' situation"
+            f"{location_text}, with a compatibility score of "
             f"{strongest_result.score:.2f}. "
-            f"The latest known report describes "
-            f"'{observation.event_type}'"
-            f"{location_text} at "
-            f"{observation.observed_at.isoformat()}. "
-            "This probable case history requires human verification."
+            "The result requires human verification."
         )
 
     @staticmethod
-    def _count_signals(
-        results: list[CorrelationResult],
-    ) -> dict[str, int]:
+    def _record_location_text(
+        record: HumanitarianRecord,
+    ) -> str | None:
         """
-        Count supporting, conflicting and unavailable signals.
+        Devuelve una ubicación legible para registros HCP 0.6 y 0.5.
         """
-        supporting = 0
-        conflicting = 0
-        unavailable = 0
+        declared_location = getattr(
+            record.observation,
+            "declared_location",
+            None,
+        )
 
-        for result in results:
-            for signal in result.signals:
-                if signal.status in {
-                    CorrelationSignalStatus.MATCH,
-                    CorrelationSignalStatus.PARTIAL_MATCH,
-                }:
-                    supporting += 1
+        if declared_location is not None:
+            values = [
+                getattr(
+                    declared_location,
+                    "district",
+                    None,
+                ),
+                getattr(
+                    declared_location,
+                    "locality",
+                    None,
+                ),
+                getattr(
+                    declared_location,
+                    "admin_level_2",
+                    None,
+                ),
+                getattr(
+                    declared_location,
+                    "admin_level_1",
+                    None,
+                ),
+                getattr(
+                    declared_location,
+                    "country_code",
+                    None,
+                ),
+            ]
 
-                elif (
-                    signal.status
-                    == CorrelationSignalStatus.CONFLICT
+            normalized_values: list[str] = []
+
+            for value in values:
+                if value is None:
+                    continue
+
+                normalized_value = (
+                    str(value).strip()
+                )
+
+                if not normalized_value:
+                    continue
+
+                # Evita duplicados consecutivos como:
+                # Cabimas, Cabimas, Zulia, VE.
+                if (
+                    normalized_values
+                    and normalized_values[-1].casefold()
+                    == normalized_value.casefold()
                 ):
-                    conflicting += 1
+                    continue
 
-                elif (
-                    signal.status
-                    == CorrelationSignalStatus.NOT_AVAILABLE
-                ):
-                    unavailable += 1
+                normalized_values.append(
+                    normalized_value
+                )
 
-        return {
-            "supporting": supporting,
-            "conflicting": conflicting,
-            "unavailable": unavailable,
-        }
+            if normalized_values:
+                return ", ".join(
+                    normalized_values
+                )
 
-    @staticmethod
-    def _count_evidence_groups(
-        signals: list[CorrelationSignal],
-    ) -> dict[str, int]:
-        """
-        Count signals by the three HCP correlation groups.
-        """
-        space = 0
-        time = 0
-        description = 0
+        legacy_location = getattr(
+            record.observation,
+            "reported_location",
+            None,
+        )
 
-        for signal in signals:
-            if signal.field in {
-                "observation.declared_location",
-                "observation.reported_location",
-            }:
-                space += 1
+        if legacy_location is None:
+            return None
 
-            elif (
-                signal.field
-                == "observation.search_time"
-            ):
-                time += 1
-
-            elif signal.field.startswith(
-                "subject."
-            ):
-                description += 1
-
-        return {
-            "space": space,
-            "time": time,
-            "description": description,
-        }
-
-    @staticmethod
-    def _location_context_sentence(
-        strongest_location: str | None,
-        latest_location: str | None,
-    ) -> str:
-        """
-        Explain geographic context without claiming verified presence.
-        """
-        if (
-            strongest_location is None
-            and latest_location is None
-        ):
-            return (
-                "No comparable declared geographic context was available."
-            )
-
-        if (
-            strongest_location
-            == latest_location
-        ):
-            return (
-                "The strongest and latest reports refer to the declared "
-                f"location '{latest_location}'."
-            )
-
-        if (
-            strongest_location is not None
-            and latest_location is not None
-        ):
-            return (
-                f"The strongest report refers to '{strongest_location}', "
-                f"while the latest report refers to '{latest_location}'. "
-                "The geographic variation remains visible for human review."
-            )
-
-        available_location = (
-            latest_location
-            or strongest_location
+        normalized_legacy = (
+            str(legacy_location).strip()
         )
 
         return (
-            "The available declared geographic context is "
-            f"'{available_location}'."
+            normalized_legacy
+            or None
         )
 
     @staticmethod
-    def _event_context_sentence(
-        strongest_record: HumanitarianRecord,
-        latest_record: HumanitarianRecord,
-    ) -> str:
-        """
-        Explain event types as situational and chronological context.
-        """
-        strongest_event = (
-            strongest_record
-            .observation
-            .event_type
-        )
-
-        latest_event = (
-            latest_record
-            .observation
-            .event_type
-        )
-
-        if (
-            strongest_event
-            == latest_event
-        ):
-            return (
-                "The latest related report describes the situation "
-                f"'{latest_event}'. Event type is used only as humanitarian "
-                "context."
-            )
-
-        return (
-            "The strongest descriptive report describes "
-            f"'{strongest_event}', while the latest report describes "
-            f"'{latest_event}'. Different event types may represent "
-            "different moments of the same probable case history."
+    def _supporting_signal_count(
+        result: CorrelationResult,
+    ) -> int:
+        return sum(
+            1
+            for signal in result.signals
+            if signal.status
+            in {
+                CorrelationSignalStatus.MATCH,
+                CorrelationSignalStatus.PARTIAL_MATCH,
+            }
         )
 
     @staticmethod
@@ -752,7 +767,7 @@ class HumanitarianCaseBuilder:
         query: HumanitarianQuery,
     ) -> str | None:
         """
-        Return the optional Query identifier.
+        Lee el identificador opcional de la consulta.
         """
         query_id = getattr(
             query,
@@ -771,24 +786,3 @@ class HumanitarianCaseBuilder:
             return None
 
         return str(query_id)
-
-    @staticmethod
-    def _confidence_sort_value(
-        value: str,
-    ) -> int:
-        """
-        Convert evidence-level labels into a deterministic sorting value.
-        """
-        values = {
-            "very_low": 0,
-            "low": 1,
-            "moderate": 2,
-            "medium": 2,
-            "high": 3,
-            "very_high": 4,
-        }
-
-        return values.get(
-            value,
-            0,
-        )
