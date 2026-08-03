@@ -3,6 +3,7 @@ from collections.abc import Iterable
 from uuid import UUID
 
 from app.models.humanitarian_record import HumanitarianRecord
+from app.models.query import HumanitarianQuery
 
 
 class RecordStorage(ABC):
@@ -118,6 +119,62 @@ class RecordStorage(ABC):
             StorageError:
                 Si los registros no pueden recuperarse o reconstruirse.
         """
+
+    def search_candidates(
+        self,
+        query: HumanitarianQuery,
+        limit: int = 100,
+    ) -> list[HumanitarianRecord]:
+        """
+        Recupera un conjunto preliminar de registros para una búsqueda HCP.
+
+        Esta operación pertenece a la capa de persistencia únicamente como
+        mecanismo para reducir de forma eficiente el espacio de búsqueda. No
+        calcula compatibilidad, no asigna puntuaciones HCP y no determina si
+        varias observaciones corresponden a un mismo caso.
+
+        Las implementaciones especializadas pueden utilizar criterios
+        estructurados y seguros de la consulta, por ejemplo:
+
+        - tipo de sujeto;
+        - país;
+        - primera división administrativa;
+        - localidad;
+        - límites y ordenamientos respaldados por índices.
+
+        La evaluación semántica final continúa siendo responsabilidad de
+        SearchService y CorrelationService.
+
+        La implementación predeterminada conserva compatibilidad con
+        almacenamientos pequeños, pruebas y nodos offline: obtiene los
+        registros mediante list_all() y limita la colección devuelta.
+
+        Args:
+            query:
+                Consulta HCP canónica que aporta criterios estructurados para
+                reducir el conjunto preliminar de registros.
+
+            limit:
+                Cantidad máxima de candidatos que puede devolver el
+                almacenamiento. Debe ser mayor o igual que 1.
+
+        Returns:
+            Lista independiente de Humanitarian Records validados que serán
+            evaluados posteriormente por SearchService.
+
+        Raises:
+            ValueError:
+                Si limit es menor que 1.
+
+            StorageError:
+                Si los registros no pueden recuperarse o reconstruirse.
+        """
+        if limit < 1:
+            raise ValueError(
+                "candidate search limit must be greater than or equal to 1"
+            )
+
+        return self.list_all()[:limit]
 
     @abstractmethod
     def exists(
