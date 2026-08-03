@@ -1,14 +1,12 @@
-import re
 import unicodedata
 from collections.abc import Iterable, Mapping
-from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy import (
+    Column,
     DateTime,
-    Engine,
     Index,
     Integer,
     MetaData,
@@ -16,14 +14,14 @@ from sqlalchemy import (
     Table,
     Text,
     Uuid,
-    Column,
     create_engine,
     func,
     insert,
     select,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import Engine, URL
 from sqlalchemy.exc import (
     IntegrityError,
     SQLAlchemyError,
@@ -45,20 +43,17 @@ metadata = MetaData()
 humanitarian_records_table = Table(
     "humanitarian_records",
     metadata,
-
     Column(
         "id",
         Uuid(as_uuid=True),
         primary_key=True,
         nullable=False,
     ),
-
     Column(
         "schema_version",
         String(16),
         nullable=False,
     ),
-
     Column(
         "source_client",
         String(160),
@@ -66,7 +61,7 @@ humanitarian_records_table = Table(
     ),
 
     # --------------------------------------------------------------
-    # Subject fields used for indexed candidate selection
+    # Subject fields projected for indexed candidate selection
     # --------------------------------------------------------------
 
     Column(
@@ -74,61 +69,51 @@ humanitarian_records_table = Table(
         String(16),
         nullable=False,
     ),
-
     Column(
         "reported_label",
         Text,
         nullable=True,
     ),
-
     Column(
         "reported_label_normalized",
         Text,
         nullable=True,
     ),
-
     Column(
         "estimated_age",
         Integer,
         nullable=True,
     ),
-
     Column(
         "recognition_features",
         Text,
         nullable=True,
     ),
-
     Column(
         "recognition_features_normalized",
         Text,
         nullable=True,
     ),
-
     Column(
         "species",
         String(160),
         nullable=True,
     ),
-
     Column(
         "species_normalized",
         String(160),
         nullable=True,
     ),
-
     Column(
         "animal_size",
         String(32),
         nullable=True,
     ),
-
     Column(
         "breed",
         String(200),
         nullable=True,
     ),
-
     Column(
         "breed_normalized",
         String(200),
@@ -136,7 +121,7 @@ humanitarian_records_table = Table(
     ),
 
     # --------------------------------------------------------------
-    # Observation fields used for indexed candidate selection
+    # Observation fields projected for indexed candidate selection
     # --------------------------------------------------------------
 
     Column(
@@ -144,73 +129,61 @@ humanitarian_records_table = Table(
         String(80),
         nullable=False,
     ),
-
     Column(
         "reported_by",
         String(80),
         nullable=False,
     ),
-
     Column(
         "observed_at",
         DateTime(timezone=True),
         nullable=False,
     ),
-
     Column(
         "country_code",
         String(2),
         nullable=True,
     ),
-
     Column(
         "admin_level_1",
         Text,
         nullable=True,
     ),
-
     Column(
         "admin_level_1_normalized",
         Text,
         nullable=True,
     ),
-
     Column(
         "admin_level_2",
         Text,
         nullable=True,
     ),
-
     Column(
         "admin_level_2_normalized",
         Text,
         nullable=True,
     ),
-
     Column(
         "locality",
         Text,
         nullable=True,
     ),
-
     Column(
         "locality_normalized",
         Text,
         nullable=True,
     ),
-
     Column(
         "district",
         Text,
         nullable=True,
     ),
-
     Column(
         "district_normalized",
         Text,
         nullable=True,
     ),
-
     Column(
         "legacy_reported_location",
         Text,
@@ -218,7 +191,7 @@ humanitarian_records_table = Table(
     ),
 
     # --------------------------------------------------------------
-    # Canonical HCP document
+    # Complete canonical HCP document
     # --------------------------------------------------------------
 
     Column(
@@ -226,7 +199,6 @@ humanitarian_records_table = Table(
         JSONB,
         nullable=False,
     ),
-
     Column(
         "created_at",
         DateTime(timezone=True),
@@ -287,17 +259,17 @@ Index(
 
 class PostgresRecordStorage(RecordStorage):
     """
-    Implementación PostgreSQL de RecordStorage.
+    PostgreSQL implementation of RecordStorage.
 
-    El registro HCP completo se conserva dentro de `record_payload` como
-    JSONB. Paralelamente, los campos más importantes se proyectan en columnas
-    relacionales para permitir búsquedas indexadas y eficientes.
+    The complete canonical Humanitarian Record is stored in `record_payload`
+    as JSONB.
 
-    Esta implementación no crea ni modifica el esquema automáticamente.
-    La estructura de la base debe administrarse mediante migraciones.
+    Important fields are additionally projected into relational columns so
+    PostgreSQL can later reduce the candidate collection before Python runs
+    the final HCP correlation.
 
-    Esto evita que el inicio de la aplicación ejecute cambios implícitos en
-    una base de datos de producción.
+    This implementation never creates or changes database tables at runtime.
+    PostgreSQL schema changes are managed exclusively through Alembic.
     """
 
     def __init__(
@@ -306,20 +278,31 @@ class PostgresRecordStorage(RecordStorage):
         *,
         engine: Engine | None = None,
         pool_pre_ping: bool = True,
-        pool_size: int = 5,
-        max_overflow: int = 10,
+        pool_size: int = 3,
+        max_overflow: int = 2,
         pool_timeout: int = 30,
         pool_recycle: int = 1_800,
+        connect_timeout: int = 10,
+        sslmode: str = "require",
+        application_name: str = "hcp-reference",
     ) -> None:
         """
-        Inicializa el almacenamiento PostgreSQL.
+        Initialize PostgreSQL storage.
 
-        Puede recibirse:
+        Supply either:
 
-        - `database_url`, para que la clase cree su propio Engine;
-        - `engine`, útil para pruebas e inyección de dependencias.
+        - database_url, allowing this class to create and own the Engine;
+        - engine, allowing an existing Engine to be injected for tests.
 
-        No deben suministrarse ambos al mismo tiempo.
+        Both values cannot be supplied simultaneously.
+
+        The default pool allows at most five local connections:
+
+            pool_size=3
+            max_overflow=2
+
+        This leaves database capacity available for Alembic migrations,
+        administrative operations and other infrastructure processes.
         """
         if (
             database_url is not None
@@ -337,26 +320,34 @@ class PostgresRecordStorage(RecordStorage):
                 "PostgresRecordStorage requires database_url or engine"
             )
 
-        self._owns_engine = (
-            engine is None
-        )
+        self._owns_engine = engine is None
+        self._closed = False
 
         if engine is not None:
             self.engine = engine
             return
 
+        normalized_url = self._normalize_database_url(
+            database_url
+        )
+
         try:
             self.engine = create_engine(
-                database_url,
+                normalized_url,
                 pool_pre_ping=pool_pre_ping,
                 pool_size=pool_size,
                 max_overflow=max_overflow,
                 pool_timeout=pool_timeout,
                 pool_recycle=pool_recycle,
-                future=True,
+                pool_use_lifo=True,
+                connect_args={
+                    "sslmode": sslmode,
+                    "connect_timeout": connect_timeout,
+                    "application_name": application_name,
+                },
             )
 
-        except (SQLAlchemyError, ValueError) as exc:
+        except (SQLAlchemyError, ValueError, TypeError) as exc:
             raise StorageError(
                 "Unable to initialize PostgreSQL storage"
             ) from exc
@@ -370,18 +361,20 @@ class PostgresRecordStorage(RecordStorage):
         record: HumanitarianRecord,
     ) -> HumanitarianRecord:
         """
-        Persiste atómicamente un Humanitarian Record.
+        Atomically persist one Humanitarian Record.
 
-        El UUID es la clave primaria. Una colisión se traduce al error
-        canónico RecordAlreadyExistsError.
+        The UUID is the primary key. A duplicate UUID is translated into the
+        canonical RecordAlreadyExistsError.
         """
-        values = self._record_to_row(
-            record
-        )
+        self._ensure_open()
 
         statement = insert(
             humanitarian_records_table
-        ).values(**values)
+        ).values(
+            **self._record_to_row(
+                record
+            )
+        )
 
         try:
             with self.engine.begin() as connection:
@@ -390,9 +383,7 @@ class PostgresRecordStorage(RecordStorage):
                 )
 
         except IntegrityError as exc:
-            if self._is_unique_violation(
-                exc
-            ):
+            if self._is_unique_violation(exc):
                 raise RecordAlreadyExistsError(
                     str(record.id)
                 ) from exc
@@ -413,16 +404,17 @@ class PostgresRecordStorage(RecordStorage):
         record_id: UUID,
     ) -> HumanitarianRecord:
         """
-        Recupera y valida un Humanitarian Record mediante su UUID.
+        Retrieve and validate one Humanitarian Record by UUID.
         """
+        self._ensure_open()
+
         statement = (
             select(
-                humanitarian_records_table
-                .c.record_payload
+                humanitarian_records_table.c.record_payload
             )
             .where(
-                humanitarian_records_table
-                .c.id == record_id
+                humanitarian_records_table.c.id
+                == record_id
             )
         )
 
@@ -451,96 +443,93 @@ class PostgresRecordStorage(RecordStorage):
         self,
     ) -> list[HumanitarianRecord]:
         """
-        Devuelve todos los registros en orden cronológico determinístico.
+        Return all records in deterministic chronological order.
 
-        Este método conserva el funcionamiento actual del motor HCP.
+        This method preserves compatibility with the current SearchService.
 
-        Más adelante, SearchService podrá utilizar consultas indexadas de
-        candidatos sin cargar toda la tabla.
+        It will later be complemented by an indexed candidate query so large
+        databases do not need to load every record into application memory.
         """
+        self._ensure_open()
+
         statement = (
             select(
-                humanitarian_records_table
-                .c.id,
-                humanitarian_records_table
-                .c.record_payload,
+                humanitarian_records_table.c.id,
+                humanitarian_records_table.c.record_payload,
             )
             .order_by(
-                humanitarian_records_table
-                .c.observed_at.asc(),
-                humanitarian_records_table
-                .c.id.asc(),
+                humanitarian_records_table.c.observed_at.asc(),
+                humanitarian_records_table.c.id.asc(),
             )
         )
 
         try:
             with self.engine.connect() as connection:
-                rows = connection.execute(
-                    statement
-                ).mappings().all()
+                rows = (
+                    connection.execute(
+                        statement
+                    )
+                    .mappings()
+                    .all()
+                )
 
         except SQLAlchemyError as exc:
             raise StorageError(
                 "Unable to list Humanitarian Records from PostgreSQL"
             ) from exc
 
-        records: list[
-            HumanitarianRecord
-        ] = []
-
-        for row in rows:
-            records.append(
-                self._payload_to_record(
-                    payload=row[
-                        "record_payload"
-                    ],
-                    record_id=row["id"],
-                )
+        return [
+            self._payload_to_record(
+                payload=row["record_payload"],
+                record_id=row["id"],
             )
-
-        return records
+            for row in rows
+        ]
 
     def exists(
         self,
         record_id: UUID,
     ) -> bool:
         """
-        Comprueba la existencia del UUID sin cargar el JSONB completo.
+        Check whether a UUID exists without loading the JSONB payload.
         """
-        statement = select(
-            humanitarian_records_table
-            .c.id
-        ).where(
-            humanitarian_records_table
-            .c.id == record_id
-        ).limit(1)
+        self._ensure_open()
+
+        statement = (
+            select(
+                humanitarian_records_table.c.id
+            )
+            .where(
+                humanitarian_records_table.c.id
+                == record_id
+            )
+            .limit(1)
+        )
 
         try:
             with self.engine.connect() as connection:
-                return (
-                    connection.execute(
-                        statement
-                    ).scalar_one_or_none()
-                    is not None
-                )
+                stored_id = connection.execute(
+                    statement
+                ).scalar_one_or_none()
 
         except SQLAlchemyError as exc:
             raise StorageError(
                 "Unable to check Humanitarian Record existence in PostgreSQL"
             ) from exc
 
+        return stored_id is not None
+
     def create_many(
         self,
-        records: Iterable[
-            HumanitarianRecord
-        ],
+        records: Iterable[HumanitarianRecord],
     ) -> list[HumanitarianRecord]:
         """
-        Persiste un lote completo dentro de una única transacción.
+        Persist an entire batch in one PostgreSQL transaction.
 
-        Si algún UUID genera conflicto o se produce otro error, PostgreSQL
-        revierte toda la operación.
+        If any record fails, PostgreSQL rolls back the complete operation.
         """
+        self._ensure_open()
+
         record_list = list(records)
 
         if not record_list:
@@ -550,32 +539,24 @@ class PostgresRecordStorage(RecordStorage):
             record_list
         )
 
-        values = [
-            self._record_to_row(
-                record
-            )
+        rows = [
+            self._record_to_row(record)
             for record in record_list
         ]
-
-        statement = insert(
-            humanitarian_records_table
-        )
 
         try:
             with self.engine.begin() as connection:
                 connection.execute(
-                    statement,
-                    values,
+                    insert(
+                        humanitarian_records_table
+                    ),
+                    rows,
                 )
 
         except IntegrityError as exc:
-            if self._is_unique_violation(
-                exc
-            ):
-                conflicting_id = (
-                    self._find_existing_id(
-                        record_list
-                    )
+            if self._is_unique_violation(exc):
+                conflicting_id = self._find_existing_id(
+                    record_list
                 )
 
                 raise RecordAlreadyExistsError(
@@ -600,12 +581,15 @@ class PostgresRecordStorage(RecordStorage):
         self,
     ) -> int:
         """
-        Devuelve la cantidad total mediante COUNT(*).
+        Return the total record count using COUNT(*).
         """
-        statement = select(
-            func.count()
-        ).select_from(
-            humanitarian_records_table
+        self._ensure_open()
+
+        statement = (
+            select(func.count())
+            .select_from(
+                humanitarian_records_table
+            )
         )
 
         try:
@@ -621,20 +605,47 @@ class PostgresRecordStorage(RecordStorage):
 
         return int(value)
 
+    def ping(
+        self,
+    ) -> bool:
+        """
+        Verify that PostgreSQL accepts a simple query.
+
+        This method does not create, update or delete any information.
+        """
+        self._ensure_open()
+
+        try:
+            with self.engine.connect() as connection:
+                value = connection.execute(
+                    text("SELECT 1")
+                ).scalar_one()
+
+        except SQLAlchemyError as exc:
+            raise StorageError(
+                "Unable to connect to PostgreSQL"
+            ) from exc
+
+        return value == 1
+
     def close(
         self,
     ) -> None:
         """
-        Libera las conexiones administradas por el Engine.
+        Release database connections owned by this storage instance.
 
-        Solo cierra el Engine cuando fue creado por esta instancia. Un Engine
-        inyectado pertenece al código que lo suministró.
+        The method is idempotent and may safely be called more than once.
         """
+        if self._closed:
+            return
+
         if self._owns_engine:
             self.engine.dispose()
 
+        self._closed = True
+
     # ------------------------------------------------------------------
-    # Conversion between HCP and relational representation
+    # HCP document and relational projection
     # ------------------------------------------------------------------
 
     @classmethod
@@ -643,9 +654,9 @@ class PostgresRecordStorage(RecordStorage):
         record: HumanitarianRecord,
     ) -> dict[str, Any]:
         """
-        Proyecta el documento HCP en columnas relacionales y JSONB.
+        Project one canonical HCP document into PostgreSQL columns.
 
-        `record_payload` continúa siendo la fuente canónica completa.
+        `record_payload` remains the complete canonical representation.
         """
         subject = record.subject
         observation = record.observation
@@ -680,149 +691,120 @@ class PostgresRecordStorage(RecordStorage):
             None,
         )
 
+        admin_level_1 = cls._location_value(
+            declared_location,
+            "admin_level_1",
+        )
+
+        admin_level_2 = cls._location_value(
+            declared_location,
+            "admin_level_2",
+        )
+
+        locality = cls._location_value(
+            declared_location,
+            "locality",
+        )
+
+        district = cls._location_value(
+            declared_location,
+            "district",
+        )
+
         return {
-            "id":
-                record.id,
+            "id": record.id,
+            "schema_version": record.schema_version,
+            "source_client": record.source_client,
+            "subject_type": subject.type,
 
-            "schema_version":
-                record.schema_version,
-
-            "source_client":
-                record.source_client,
-
-            "subject_type":
-                subject.type,
-
-            "reported_label":
-                reported_label,
-
-            "reported_label_normalized":
+            "reported_label": reported_label,
+            "reported_label_normalized": (
                 cls._normalize_search_text(
                     reported_label
-                ),
+                )
+            ),
 
-            "estimated_age":
-                getattr(
-                    subject,
-                    "estimated_age",
-                    None,
-                ),
+            "estimated_age": getattr(
+                subject,
+                "estimated_age",
+                None,
+            ),
 
-            "recognition_features":
-                recognition_features,
-
-            "recognition_features_normalized":
+            "recognition_features": recognition_features,
+            "recognition_features_normalized": (
                 cls._normalize_search_text(
                     recognition_features
-                ),
+                )
+            ),
 
-            "species":
-                species,
-
-            "species_normalized":
+            "species": species,
+            "species_normalized": (
                 cls._normalize_search_text(
                     species
-                ),
+                )
+            ),
 
-            "animal_size":
-                getattr(
-                    subject,
-                    "size",
-                    None,
-                ),
+            "animal_size": getattr(
+                subject,
+                "size",
+                None,
+            ),
 
-            "breed":
-                breed,
-
-            "breed_normalized":
+            "breed": breed,
+            "breed_normalized": (
                 cls._normalize_search_text(
                     breed
-                ),
+                )
+            ),
 
-            "event_type":
-                observation.event_type,
+            "event_type": observation.event_type,
+            "reported_by": observation.reported_by,
+            "observed_at": observation.observed_at,
 
-            "reported_by":
-                observation.reported_by,
+            "country_code": cls._location_value(
+                declared_location,
+                "country_code",
+                uppercase=True,
+            ),
 
-            "observed_at":
-                observation.observed_at,
-
-            "country_code":
-                cls._location_value(
-                    declared_location,
-                    "country_code",
-                    uppercase=True,
-                ),
-
-            "admin_level_1":
-                cls._location_value(
-                    declared_location,
-                    "admin_level_1",
-                ),
-
-            "admin_level_1_normalized":
+            "admin_level_1": admin_level_1,
+            "admin_level_1_normalized": (
                 cls._normalize_search_text(
-                    cls._location_value(
-                        declared_location,
-                        "admin_level_1",
-                    )
-                ),
+                    admin_level_1
+                )
+            ),
 
-            "admin_level_2":
-                cls._location_value(
-                    declared_location,
-                    "admin_level_2",
-                ),
-
-            "admin_level_2_normalized":
+            "admin_level_2": admin_level_2,
+            "admin_level_2_normalized": (
                 cls._normalize_search_text(
-                    cls._location_value(
-                        declared_location,
-                        "admin_level_2",
-                    )
-                ),
+                    admin_level_2
+                )
+            ),
 
-            "locality":
-                cls._location_value(
-                    declared_location,
-                    "locality",
-                ),
-
-            "locality_normalized":
+            "locality": locality,
+            "locality_normalized": (
                 cls._normalize_search_text(
-                    cls._location_value(
-                        declared_location,
-                        "locality",
-                    )
-                ),
+                    locality
+                )
+            ),
 
-            "district":
-                cls._location_value(
-                    declared_location,
-                    "district",
-                ),
-
-            "district_normalized":
+            "district": district,
+            "district_normalized": (
                 cls._normalize_search_text(
-                    cls._location_value(
-                        declared_location,
-                        "district",
-                    )
-                ),
+                    district
+                )
+            ),
 
-            "legacy_reported_location":
-                getattr(
-                    observation,
-                    "reported_location",
-                    None,
-                ),
+            "legacy_reported_location": getattr(
+                observation,
+                "reported_location",
+                None,
+            ),
 
-            "record_payload":
-                record.model_dump(
-                    mode="json",
-                    exclude_none=True,
-                ),
+            "record_payload": record.model_dump(
+                mode="json",
+                exclude_none=True,
+            ),
         }
 
     @staticmethod
@@ -831,22 +813,16 @@ class PostgresRecordStorage(RecordStorage):
         record_id: UUID,
     ) -> HumanitarianRecord:
         """
-        Reconstruye y valida el documento canónico almacenado en JSONB.
+        Reconstruct and validate one canonical record stored as JSONB.
         """
-        if not isinstance(
-            payload,
-            Mapping,
-        ):
+        if not isinstance(payload, Mapping):
             raise InvalidStorageDataError(
                 "PostgreSQL record_payload must contain a JSON object"
             )
 
         try:
-            record = (
-                HumanitarianRecord
-                .model_validate(
-                    dict(payload)
-                )
+            record = HumanitarianRecord.model_validate(
+                dict(payload)
             )
 
         except ValidationError as exc:
@@ -869,12 +845,10 @@ class PostgresRecordStorage(RecordStorage):
 
     @staticmethod
     def _validate_batch_ids(
-        records: list[
-            HumanitarianRecord
-        ],
+        records: list[HumanitarianRecord],
     ) -> None:
         """
-        Rechaza identificadores repetidos dentro del mismo lote.
+        Reject duplicate UUIDs contained in the same import batch.
         """
         seen_ids: set[UUID] = set()
 
@@ -884,18 +858,14 @@ class PostgresRecordStorage(RecordStorage):
                     str(record.id)
                 )
 
-            seen_ids.add(
-                record.id
-            )
+            seen_ids.add(record.id)
 
     def _find_existing_id(
         self,
-        records: list[
-            HumanitarianRecord
-        ],
+        records: list[HumanitarianRecord],
     ) -> UUID | None:
         """
-        Intenta identificar el UUID que ya existe tras un conflicto de lote.
+        Attempt to identify an existing UUID following a batch conflict.
         """
         record_ids = [
             record.id
@@ -904,12 +874,10 @@ class PostgresRecordStorage(RecordStorage):
 
         statement = (
             select(
-                humanitarian_records_table
-                .c.id
+                humanitarian_records_table.c.id
             )
             .where(
-                humanitarian_records_table
-                .c.id.in_(
+                humanitarian_records_table.c.id.in_(
                     record_ids
                 )
             )
@@ -930,9 +898,7 @@ class PostgresRecordStorage(RecordStorage):
         error: IntegrityError,
     ) -> bool:
         """
-        Reconoce una violación UNIQUE de PostgreSQL.
-
-        SQLSTATE 23505 representa unique_violation.
+        Detect PostgreSQL SQLSTATE 23505: unique_violation.
         """
         original_error = error.orig
 
@@ -961,8 +927,71 @@ class PostgresRecordStorage(RecordStorage):
         )
 
     # ------------------------------------------------------------------
-    # Normalization helpers
+    # Connection and normalization helpers
     # ------------------------------------------------------------------
+
+    def _ensure_open(
+        self,
+    ) -> None:
+        if self._closed:
+            raise StorageError(
+                "PostgreSQL storage is closed"
+            )
+
+    @staticmethod
+    def _normalize_database_url(
+        database_url: str | URL | None,
+    ) -> str | URL:
+        """
+        Ensure string URLs use the SQLAlchemy Psycopg 3 dialect.
+
+        Accepted input prefixes:
+
+            postgres://
+            postgresql://
+            postgresql+psycopg://
+        """
+        if database_url is None:
+            raise ValueError(
+                "database_url cannot be None"
+            )
+
+        if isinstance(database_url, URL):
+            return database_url
+
+        normalized_url = database_url.strip()
+
+        if not normalized_url:
+            raise ValueError(
+                "database_url cannot be empty"
+            )
+
+        if normalized_url.startswith(
+            "postgres://"
+        ):
+            return normalized_url.replace(
+                "postgres://",
+                "postgresql+psycopg://",
+                1,
+            )
+
+        if normalized_url.startswith(
+            "postgresql://"
+        ):
+            return normalized_url.replace(
+                "postgresql://",
+                "postgresql+psycopg://",
+                1,
+            )
+
+        if not normalized_url.startswith(
+            "postgresql+psycopg://"
+        ):
+            raise ValueError(
+                "database_url must use a PostgreSQL connection scheme"
+            )
+
+        return normalized_url
 
     @staticmethod
     def _location_value(
@@ -983,18 +1012,13 @@ class PostgresRecordStorage(RecordStorage):
         if value is None:
             return None
 
-        normalized_value = str(
-            value
-        ).strip()
+        normalized_value = str(value).strip()
 
         if not normalized_value:
             return None
 
         if uppercase:
-            return (
-                normalized_value
-                .upper()
-            )
+            return normalized_value.upper()
 
         return normalized_value
 
@@ -1003,26 +1027,27 @@ class PostgresRecordStorage(RecordStorage):
         value: str | None,
     ) -> str | None:
         """
-        Normaliza texto de búsqueda de forma determinística.
+        Normalize search text without changing the original HCP value.
 
-        Esta proyección no sustituye el contenido original del protocolo.
-        Solo produce una columna auxiliar indexable.
+        The resulting value:
+
+        - is case-insensitive;
+        - removes accents;
+        - converts punctuation into spaces;
+        - collapses repeated whitespace;
+        - preserves letters and numbers from supported writing systems.
         """
         if value is None:
             return None
 
-        stripped_value = (
-            value.strip()
-        )
+        stripped_value = value.strip()
 
         if not stripped_value:
             return None
 
-        decomposed = (
-            unicodedata.normalize(
-                "NFKD",
-                stripped_value.casefold(),
-            )
+        decomposed = unicodedata.normalize(
+            "NFKD",
+            stripped_value.casefold(),
         )
 
         without_accents = "".join(
@@ -1033,13 +1058,15 @@ class PostgresRecordStorage(RecordStorage):
             )
         )
 
-        normalized_value = re.sub(
-            r"[^a-z0-9]+",
-            " ",
-            without_accents,
-        ).strip()
-
-        return (
-            normalized_value
-            or None
+        alphanumeric_text = "".join(
+            character
+            if character.isalnum()
+            else " "
+            for character in without_accents
         )
+
+        normalized_value = " ".join(
+            alphanumeric_text.split()
+        )
+
+        return normalized_value or None
