@@ -11,6 +11,7 @@ from app.core.errors import (
     StorageError,
 )
 from app.models.humanitarian_record import HumanitarianRecord
+from app.models.query import HumanitarianQuery
 from app.storage.base import RecordStorage
 
 
@@ -23,11 +24,17 @@ class JSONRecordStorage(RecordStorage):
     - desarrollo local;
     - pruebas unitarias;
     - ejemplos educativos;
-    - migraciones hacia PostgreSQL.
+    - migraciones hacia PostgreSQL;
+    - nodos pequeños u offline.
 
-    Aunque la implementación de producción utilizará PostgreSQL,
+    Aunque la implementación de producción utiliza PostgreSQL,
     JSONRecordStorage continúa siendo importante porque representa el
     comportamiento esperado del contrato RecordStorage.
+
+    La búsqueda de candidatos en JSON conserva deliberadamente un
+    comportamiento sencillo: carga los registros disponibles y limita la
+    colección devuelta. La evaluación semántica continúa siendo
+    responsabilidad de SearchService.
     """
 
     def __init__(
@@ -61,7 +68,9 @@ class JSONRecordStorage(RecordStorage):
 
         records.append(record)
 
-        self._write_records(records)
+        self._write_records(
+            records
+        )
 
         return record
 
@@ -86,11 +95,75 @@ class JSONRecordStorage(RecordStorage):
         """
         Devuelve todos los registros locales.
 
-        Se devuelve una copia independiente para impedir modificaciones
-        accidentales sobre la colección interna.
+        Se devuelve una colección independiente para impedir modificaciones
+        accidentales sobre la estructura cargada desde el archivo.
         """
         return list(
             self._load_records()
+        )
+
+    def search_candidates(
+        self,
+        query: HumanitarianQuery,
+        limit: int = 100,
+    ) -> list[HumanitarianRecord]:
+        """
+        Recupera registros preliminares para una búsqueda HCP.
+
+        JSONRecordStorage no intenta trasladar a la persistencia las reglas
+        semánticas de búsqueda ni de correlación. La consulta se recibe para
+        cumplir el contrato común de RecordStorage, pero todos los registros
+        continúan siendo considerados potenciales candidatos antes de que
+        SearchService los evalúe.
+
+        Esta estrategia mantiene el comportamiento histórico de los nodos
+        JSON y resulta adecuada para:
+
+        - desarrollo;
+        - pruebas;
+        - ejemplos;
+        - nodos offline con pocos registros.
+
+        PostgreSQL sobrescribe esta operación con un prefiltro estructurado
+        respaldado por índices.
+
+        Args:
+            query:
+                Consulta HCP canónica. En la implementación JSON no se utiliza
+                para descartar registros preliminares.
+
+            limit:
+                Cantidad máxima de registros que puede devolver el método.
+                Debe ser mayor o igual que 1.
+
+        Returns:
+            Lista de Humanitarian Records validados, limitada al máximo
+            solicitado.
+
+        Raises:
+            ValueError:
+                Si limit es menor que 1.
+
+            StorageError:
+                Si el archivo no puede leerse.
+
+            InvalidStorageDataError:
+                Si el contenido persistido no representa registros HCP
+                válidos.
+        """
+        if limit < 1:
+            raise ValueError(
+                "candidate search limit must be greater than or equal to 1"
+            )
+
+        # La consulta forma parte del contrato común, aunque JSON no aplica
+        # todavía un prefiltro de persistencia.
+        _ = query
+
+        records = self._load_records()
+
+        return list(
+            records[:limit]
         )
 
     def exists(
@@ -150,7 +223,9 @@ class JSONRecordStorage(RecordStorage):
             current_records
         )
 
-        return list(records)
+        return list(
+            records
+        )
 
     def count(
         self,
@@ -168,8 +243,7 @@ class JSONRecordStorage(RecordStorage):
         """
         JSON no mantiene conexiones abiertas.
 
-        El método existe únicamente para mantener compatibilidad con futuras
-        implementaciones PostgreSQL.
+        El método existe para cumplir el contrato común de RecordStorage.
         """
         return
 
