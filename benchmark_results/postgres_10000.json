@@ -1,0 +1,20 @@
+{
+  "storage": "postgres",
+  "records": 10000,
+  "repeats": 5,
+  "warmups": 1,
+  "candidate_fetch_limit": 100,
+  "candidate_multiplier": 5,
+  "max_candidate_fetch_limit": 500,
+  "result_limit": 20,
+  "candidate_search_ms": 159.28110014647245,
+  "candidate_evaluation_ms": 13.447500066831708,
+  "correlation_ms": 2.373900031670928,
+  "case_builder_ms": 1.1602998711168766,
+  "total_ms": 178.9473001845181,
+  "candidates_fetched": 100,
+  "search_results": 20,
+  "correlation_results": 20,
+  "case_built": true,
+  "generated_at": "2026-08-04T15:02:00.770388+00:00"
+}

@@ -1,0 +1,20 @@
+{
+  "storage": "json",
+  "records": 10000,
+  "repeats": 5,
+  "warmups": 1,
+  "candidate_fetch_limit": 100,
+  "candidate_multiplier": 5,
+  "max_candidate_fetch_limit": 500,
+  "result_limit": 20,
+  "candidate_search_ms": 240.75120012275875,
+  "candidate_evaluation_ms": 2.26969993673265,
+  "correlation_ms": 0.197600107640028,
+  "case_builder_ms": 0.2031000331044197,
+  "total_ms": 243.57980000786483,
+  "candidates_fetched": 100,
+  "search_results": 1,
+  "correlation_results": 1,
+  "case_built": true,
+  "generated_at": "2026-08-04T13:34:37.312576+00:00"
+}
