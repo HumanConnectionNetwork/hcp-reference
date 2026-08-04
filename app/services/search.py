@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 from app.core.errors import QueryProcessingError
+from app.core.search_settings import SearchSettings
 from app.models.humanitarian_record import HumanitarianRecord
 from app.models.query import HumanitarianQuery
 from app.storage.base import RecordStorage
@@ -63,8 +64,10 @@ class SearchService:
     def __init__(
         self,
         storage: RecordStorage,
+        settings: SearchSettings | None = None,
     ) -> None:
         self.storage = storage
+        self.settings = settings or SearchSettings()
 
     def search_records(
         self,
@@ -143,8 +146,8 @@ class SearchService:
                 "Unable to process the local Humanitarian Record search"
             ) from exc
 
-    @staticmethod
     def _candidate_fetch_limit(
+        self,
         result_limit: int | None,
     ) -> int:
         """
@@ -162,15 +165,20 @@ class SearchService:
         Returns:
             Maximum number of preliminary records requested from storage.
         """
-        default_candidate_limit = 100
-        candidate_multiplier = 5
-
         if result_limit is None:
-            return default_candidate_limit
+            return self.settings.candidate_fetch_limit
 
-        return max(
-            default_candidate_limit,
-            result_limit * candidate_multiplier,
+        scaled_limit = (
+            result_limit
+            * self.settings.candidate_multiplier
+        )
+
+        return min(
+            self.settings.max_candidate_fetch_limit,
+            max(
+                self.settings.candidate_fetch_limit,
+                scaled_limit,
+            ),
         )
 
     def _evaluate_candidate(
