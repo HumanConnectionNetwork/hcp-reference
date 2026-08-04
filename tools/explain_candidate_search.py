@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Explain PostgreSQL execution plan for HCP candidate search."""
 from __future__ import annotations
