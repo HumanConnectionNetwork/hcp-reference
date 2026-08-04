@@ -1,0 +1,56 @@
+{
+  "action": "search",
+  "storage": "postgres",
+  "dataset": "benchmark100k",
+  "records": 100000,
+  "repeats": 20,
+  "warmups": 1,
+  "result_limit": 20,
+  "candidate_fetch_limit": 100,
+  "candidate_multiplier": 5,
+  "max_candidate_fetch_limit": 500,
+  "candidate_search": {
+    "median_ms": 143.06445000693202,
+    "minimum_ms": 135.172100039199,
+    "maximum_ms": 181.85879988595843,
+    "mean_ms": 145.20014501176775,
+    "standard_deviation_ms": 10.339620854335363
+  },
+  "candidate_evaluation": {
+    "median_ms": 16.302550095133483,
+    "minimum_ms": 16.08450012281537,
+    "maximum_ms": 18.38789996691048,
+    "mean_ms": 16.572199983056635,
+    "standard_deviation_ms": 0.7357530934774034
+  },
+  "correlation": {
+    "median_ms": 0.1810499234125018,
+    "minimum_ms": 0.17520016990602016,
+    "maximum_ms": 0.3162000793963671,
+    "mean_ms": 0.19537503831088543,
+    "standard_deviation_ms": 0.034862791721586225
+  },
+  "case_builder": {
+    "median_ms": 0.1700500724837184,
+    "minimum_ms": 0.16419985331594944,
+    "maximum_ms": 0.2607000060379505,
+    "mean_ms": 0.1786750042811036,
+    "standard_deviation_ms": 0.022086531084596253
+  },
+  "total_pipeline": {
+    "median_ms": 159.76914996281266,
+    "minimum_ms": 151.78690012544394,
+    "maximum_ms": 198.58259987086058,
+    "mean_ms": 162.14760999428108,
+    "standard_deviation_ms": 10.543194349445736
+  },
+  "candidates_fetched": 100,
+  "search_results": 1,
+  "correlation_results": 1,
+  "case_built": true,
+  "generated_at": "2026-08-04T16:48:31.793734+00:00",
+  "dataset_generation_ms": null,
+  "storage_preparation_ms": null,
+  "cleanup_ms": null,
+  "lifecycle_total_ms": null
+}
