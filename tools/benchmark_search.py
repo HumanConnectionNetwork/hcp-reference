@@ -2,39 +2,61 @@
 """
 Official HCP search benchmark.
 
-The tool generates reproducible Humanitarian Records and supports two modes:
+The tool supports four actions:
 
-- lifecycle: prepare data, execute the search pipeline and clean up;
-- search-only: prepare data once and report only repeated search-pipeline timing.
+- lifecycle:
+    Generate a temporary dataset, prepare storage, run the complete HCP search
+    pipeline and remove the dataset.
 
-It reports timing for:
+- prepare:
+    Create a named reusable benchmark dataset.
 
-- candidate retrieval;
-- semantic candidate evaluation;
-- correlation;
-- Humanitarian Case construction;
-- total pipeline time.
+- search:
+    Run only the HCP search pipeline against a previously prepared dataset.
 
-Examples
---------
+- cleanup:
+    Remove a previously prepared dataset.
 
-JSON benchmark using a temporary file:
+Legacy compatibility
+--------------------
 
-    python tools/benchmark_search.py --storage json --records 10000
+The former arguments remain accepted:
 
-PostgreSQL benchmark using a disposable or development database:
+    --mode lifecycle
+    --mode search-only
+
+They map to:
+
+    --action lifecycle
+
+A reusable dataset should use the explicit actions:
 
     python tools/benchmark_search.py \
+        --action prepare \
         --storage postgres \
-        --records 10000 \
-        --database-url "postgresql+psycopg://..."
-
-Export results:
+        --records 100000 \
+        --dataset benchmark100k
 
     python tools/benchmark_search.py \
-        --storage json \
-        --records 10000 \
-        --output benchmark_results/search_10000.json
+        --action search \
+        --storage postgres \
+        --dataset benchmark100k \
+        --repeats 20
+
+    python tools/benchmark_search.py \
+        --action cleanup \
+        --storage postgres \
+        --dataset benchmark100k
+
+Safety
+------
+
+- Repository-level .env values are loaded automatically.
+- Existing process environment variables take precedence over .env.
+- PostgreSQL datasets are identified by source_client and a dataset-specific
+  synthetic geographic context.
+- JSON reusable datasets are stored under benchmark_datasets/ by default.
+- Prepared datasets are never removed by the search action.
 """
 
 from __future__ import annotations
@@ -42,15 +64,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid5, NAMESPACE_URL
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -62,7 +85,8 @@ if str(PROJECT_ROOT) not in sys.path:
     )
 
 
-from sqlalchemy import delete  # noqa: E402
+from sqlalchemy import delete, func, select  # noqa: E402
+from sqlalchemy.exc import SQLAlchemyError  # noqa: E402
 
 from app.core.search_settings import SearchSettings  # noqa: E402
 from app.models.humanitarian_record import HumanitarianRecord  # noqa: E402
@@ -80,7 +104,10 @@ from app.storage.postgres_store import (  # noqa: E402
 
 
 BENCHMARK_SOURCE_PREFIX = "hcp_benchmark_search"
-DEFAULT_RECORD_COUNTS = (100, 1_000, 10_000, 100_000)
+DEFAULT_DATASET_DIRECTORY = PROJECT_ROOT / "benchmark_datasets"
+DEFAULT_OUTPUT_DIRECTORY = PROJECT_ROOT / "benchmark_results"
+DATASET_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$")
+SYNTHETIC_COUNTRY_CODE = "XZ"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,40 +124,45 @@ class IterationMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class MetricStatistics:
+    median_ms: float
+    minimum_ms: float
+    maximum_ms: float
+    mean_ms: float
+    standard_deviation_ms: float
+
+
+@dataclass(frozen=True, slots=True)
 class BenchmarkSummary:
-    mode: str
+    action: str
     storage: str
+    dataset: str
     records: int
     repeats: int
     warmups: int
+    result_limit: int
     candidate_fetch_limit: int
     candidate_multiplier: int
     max_candidate_fetch_limit: int
-    result_limit: int
-    candidate_search_ms: float
-    candidate_evaluation_ms: float
-    correlation_ms: float
-    case_builder_ms: float
-    total_ms: float
+    candidate_search: MetricStatistics
+    candidate_evaluation: MetricStatistics
+    correlation: MetricStatistics
+    case_builder: MetricStatistics
+    total_pipeline: MetricStatistics
     candidates_fetched: int
     search_results: int
     correlation_results: int
     case_built: bool
-    dataset_generation_ms: float | None
-    storage_preparation_ms: float | None
-    cleanup_ms: float | None
-    lifecycle_total_ms: float | None
     generated_at: str
+    dataset_generation_ms: float | None = None
+    storage_preparation_ms: float | None = None
+    cleanup_ms: float | None = None
+    lifecycle_total_ms: float | None = None
 
 
 class TimedRecordStorage(RecordStorage):
     """
     Transparent RecordStorage decorator that measures candidate retrieval.
-
-    SearchService still receives a RecordStorage abstraction and executes its
-    normal behavior. The decorator records only the time spent inside
-    search_candidates(), allowing semantic evaluation time to be derived from
-    the complete SearchService duration.
     """
 
     def __init__(
@@ -201,13 +233,11 @@ class TimedRecordStorage(RecordStorage):
         self.storage.close()
 
 
-
 def load_local_environment() -> None:
     """
     Load simple KEY=VALUE entries from the repository-level .env file.
 
-    Existing environment variables always take precedence. This keeps the
-    benchmark aligned with the backend without adding a dotenv dependency.
+    Existing process environment variables always take precedence.
     """
     env_path = PROJECT_ROOT / ".env"
 
@@ -240,42 +270,82 @@ def load_local_environment() -> None:
                 value,
             )
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate reproducible HCP records and benchmark the complete "
-            "candidate-search, correlation and case-building pipeline."
+            "Prepare reusable HCP benchmark datasets, run search-only "
+            "measurements, clean datasets or execute the complete lifecycle."
         )
     )
 
     parser.add_argument(
-        "--mode",
-        choices=("lifecycle", "search-only"),
-        default="lifecycle",
+        "--action",
+        choices=(
+            "lifecycle",
+            "prepare",
+            "search",
+            "cleanup",
+        ),
+        default=None,
         help=(
-            "Benchmark mode. lifecycle preserves the complete automatic "
-            "generate/load/search/cleanup workflow. search-only prepares the "
-            "dataset once and reports only repeated search-pipeline timing. "
-            "Default: lifecycle."
+            "Operation to execute. Default: lifecycle. "
+            "Use prepare/search/cleanup for reusable datasets."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "lifecycle",
+            "search-only",
+        ),
+        default=None,
+        help=(
+            "Deprecated compatibility option. Both values execute a temporary "
+            "lifecycle. Use --action prepare/search/cleanup for persistent "
+            "datasets."
         ),
     )
     parser.add_argument(
         "--storage",
-        choices=("json", "postgres"),
+        choices=(
+            "json",
+            "postgres",
+        ),
         default="json",
-        help="Storage backend used by the benchmark.",
+        help="Storage backend. Default: json.",
+    )
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help=(
+            "Reusable dataset name. Required for prepare, search and cleanup. "
+            "Use letters, numbers, dots, underscores or hyphens."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=DEFAULT_DATASET_DIRECTORY,
+        help=(
+            "Directory used for reusable JSON datasets. "
+            "Default: benchmark_datasets."
+        ),
     )
     parser.add_argument(
         "--records",
         type=int,
         default=10_000,
-        help="Number of generated records. Default: 10000.",
+        help=(
+            "Records generated by lifecycle or prepare. "
+            "Default: 10000."
+        ),
     )
     parser.add_argument(
         "--repeats",
         type=int,
         default=5,
-        help="Measured pipeline executions. Default: 5.",
+        help="Measured search executions. Default: 5.",
     )
     parser.add_argument(
         "--warmups",
@@ -311,31 +381,37 @@ def parse_args() -> argparse.Namespace:
         "--database-url",
         default=None,
         help=(
-            "PostgreSQL URL. Required for --storage postgres unless "
-            "DATABASE_URL is defined."
+            "PostgreSQL URL. When omitted, DATABASE_URL is used."
         ),
     )
     parser.add_argument(
         "--initialize-schema",
         action="store_true",
         help=(
-            "Create the humanitarian_records table when using PostgreSQL. "
-            "Use only with a disposable or development database."
+            "Create the PostgreSQL table and indexes when absent. "
+            "Use only with disposable or development databases."
+        ),
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help=(
+            "Replace an existing named dataset during prepare."
         ),
     )
     parser.add_argument(
         "--keep-data",
         action="store_true",
         help=(
-            "Keep generated PostgreSQL benchmark records after execution. "
-            "By default they are removed."
+            "Keep the temporary PostgreSQL dataset after lifecycle. "
+            "Named prepared datasets are always kept until cleanup."
         ),
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="Optional JSON output path.",
+        help="Optional JSON result path.",
     )
     parser.add_argument(
         "--seed",
@@ -345,6 +421,38 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+
+    if args.action is None:
+        args.action = "lifecycle"
+
+    if args.mode is not None:
+        if args.action != "lifecycle":
+            parser.error(
+                "--mode cannot be combined with a non-lifecycle --action"
+            )
+
+        # Legacy search-only prepared data inside the same execution, so it is
+        # still mapped to lifecycle. The reported pipeline remains search-only.
+        args.action = "lifecycle"
+
+    if (
+        args.action
+        in {
+            "prepare",
+            "search",
+            "cleanup",
+        }
+        and not args.dataset
+    ):
+        parser.error(
+            "--dataset is required for prepare, search and cleanup"
+        )
+
+    if args.dataset is not None:
+        validate_dataset_name(
+            args.dataset,
+            parser=parser,
+        )
 
     positive_fields = {
         "--records": args.records,
@@ -362,7 +470,9 @@ def parse_args() -> argparse.Namespace:
             )
 
     if args.warmups < 0:
-        parser.error("--warmups must be greater than or equal to 0")
+        parser.error(
+            "--warmups must be greater than or equal to 0"
+        )
 
     if (
         args.max_candidate_fetch_limit
@@ -376,10 +486,72 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def build_query() -> HumanitarianQuery:
+def validate_dataset_name(
+    dataset: str,
+    *,
+    parser: argparse.ArgumentParser | None = None,
+) -> None:
+    if DATASET_NAME_PATTERN.fullmatch(
+        dataset
+    ):
+        return
+
+    message = (
+        "dataset name must start with a letter or number and contain only "
+        "letters, numbers, dots, underscores or hyphens; maximum length is 80"
+    )
+
+    if parser is not None:
+        parser.error(
+            message
+        )
+
+    raise ValueError(
+        message
+    )
+
+
+def dataset_source_client(
+    dataset: str,
+) -> str:
+    return (
+        f"{BENCHMARK_SOURCE_PREFIX}:"
+        f"{dataset}"
+    )
+
+
+def dataset_admin_level_1(
+    dataset: str,
+) -> str:
+    digest = uuid5(
+        NAMESPACE_URL,
+        dataset,
+    ).hex[:16]
+
+    return f"HCP Benchmark {digest}"
+
+
+def json_dataset_path(
+    dataset_directory: Path,
+    dataset: str,
+) -> Path:
+    return (
+        dataset_directory
+        / f"{dataset}.json"
+    )
+
+
+def build_query(
+    dataset: str,
+) -> HumanitarianQuery:
     return HumanitarianQuery.model_validate(
         {
-            "query_id": "2b2e1874-9fa1-47a5-af83-947013b1de44",
+            "query_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"hcp-benchmark-query:{dataset}",
+                )
+            ),
             "subject": {
                 "type": "human",
                 "reported_label": "María González",
@@ -390,11 +562,13 @@ def build_query() -> HumanitarianQuery:
             },
             "observation": {
                 "declared_location": {
-                    "country_code": "VE",
-                    "admin_level_1": "Distrito Capital",
-                    "admin_level_2": "Libertador",
-                    "locality": "Caracas",
-                    "district": "La Candelaria",
+                    "country_code": SYNTHETIC_COUNTRY_CODE,
+                    "admin_level_1": dataset_admin_level_1(
+                        dataset
+                    ),
+                    "admin_level_2": "Benchmark",
+                    "locality": "HCP Synthetic City",
+                    "district": "Benchmark District",
                 },
                 "searched_at": "2026-08-04T12:00:00Z",
             },
@@ -406,16 +580,18 @@ def generate_records(
     count: int,
     *,
     seed: int,
-    run_id: str,
+    dataset: str,
 ) -> list[HumanitarianRecord]:
     """
-    Generate deterministic schema 0.6 records.
-
-    A controlled minority is geographically and descriptively compatible with
-    the benchmark query. The remaining records exercise storage filtering and
-    semantic rejection.
+    Generate deterministic canonical records isolated by dataset geography.
     """
     records: list[HumanitarianRecord] = []
+    source_client = dataset_source_client(
+        dataset
+    )
+    admin_level_1 = dataset_admin_level_1(
+        dataset
+    )
     base_time = datetime(
         2026,
         8,
@@ -425,30 +601,12 @@ def generate_records(
         tzinfo=timezone.utc,
     )
 
-    alternate_locations = (
-        ("VE", "Zulia", "Maracaibo"),
-        ("VE", "Carabobo", "Valencia"),
-        ("BR", "Rio de Janeiro", "Rio das Ostras"),
-        ("CO", "Distrito Capital", "Bogotá"),
-    )
-
-    for index in range(count):
-        matching_location = index % 20 == 0
-        matching_description = index % 100 == 0
-
-        if matching_location:
-            country_code = "VE"
-            admin_level_1 = "Distrito Capital"
-            locality = "Caracas"
-        else:
-            (
-                country_code,
-                admin_level_1,
-                locality,
-            ) = alternate_locations[
-                (index + seed)
-                % len(alternate_locations)
-            ]
+    for index in range(
+        count
+    ):
+        matching_description = (
+            index % 100 == 0
+        )
 
         if matching_description:
             reported_label = "María González"
@@ -457,23 +615,41 @@ def generate_records(
                 "cabello negro chaqueta azul cicatriz ceja derecha"
             )
         else:
-            reported_label = f"Persona Benchmark {index:08d}"
-            estimated_age = 18 + ((index + seed) % 70)
+            reported_label = (
+                f"Persona Benchmark {index:08d}"
+            )
+            estimated_age = (
+                18
+                + (
+                    (
+                        index
+                        + seed
+                    )
+                    % 70
+                )
+            )
             recognition_features = (
                 f"descripcion sintetica benchmark numero {index}"
             )
 
         record_id = uuid5(
             NAMESPACE_URL,
-            f"{run_id}:{seed}:{index}",
+            (
+                f"hcp-benchmark-record:"
+                f"{dataset}:"
+                f"{seed}:"
+                f"{index}"
+            ),
         )
 
         records.append(
             HumanitarianRecord.model_validate(
                 {
-                    "id": str(record_id),
+                    "id": str(
+                        record_id
+                    ),
                     "schema_version": "0.6",
-                    "source_client": run_id,
+                    "source_client": source_client,
                     "subject": {
                         "type": "human",
                         "reported_label": reported_label,
@@ -489,22 +665,16 @@ def generate_records(
                         "reported_by": "volunteer",
                         "observed_at": (
                             base_time
-                            - timedelta(minutes=index)
+                            - timedelta(
+                                minutes=index
+                            )
                         ).isoformat(),
                         "declared_location": {
-                            "country_code": country_code,
+                            "country_code": SYNTHETIC_COUNTRY_CODE,
                             "admin_level_1": admin_level_1,
-                            "admin_level_2": (
-                                "Libertador"
-                                if matching_location
-                                else "Benchmark"
-                            ),
-                            "locality": locality,
-                            "district": (
-                                "La Candelaria"
-                                if matching_location
-                                else None
-                            ),
+                            "admin_level_2": "Benchmark",
+                            "locality": "HCP Synthetic City",
+                            "district": "Benchmark District",
                         },
                     },
                 }
@@ -518,7 +688,16 @@ def write_json_dataset(
     path: Path,
     records: list[HumanitarianRecord],
 ) -> None:
-    path.write_text(
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_path = path.with_suffix(
+        f"{path.suffix}.tmp"
+    )
+
+    temporary_path.write_text(
         json.dumps(
             [
                 record.model_dump(
@@ -532,44 +711,36 @@ def write_json_dataset(
         encoding="utf-8",
     )
 
+    temporary_path.replace(
+        path
+    )
 
-def create_storage(
+
+def resolve_database_url(
     args: argparse.Namespace,
-    records: list[HumanitarianRecord],
-) -> tuple[RecordStorage, tempfile.TemporaryDirectory[str] | None]:
-    if args.storage == "json":
-        temporary_directory = tempfile.TemporaryDirectory(
-            prefix="hcp-search-benchmark-"
-        )
-        storage_path = (
-            Path(temporary_directory.name)
-            / "hcp_records.json"
-        )
-
-        write_json_dataset(
-            storage_path,
-            records,
-        )
-
-        return (
-            JSONRecordStorage(
-                file_path=storage_path,
-            ),
-            temporary_directory,
-        )
-
+) -> str:
     database_url = (
         args.database_url
-        or os.getenv("DATABASE_URL")
+        or os.getenv(
+            "DATABASE_URL"
+        )
     )
 
     if not database_url:
         raise SystemExit(
-            "PostgreSQL benchmark requires --database-url or DATABASE_URL."
+            "PostgreSQL action requires --database-url or DATABASE_URL."
         )
 
+    return database_url
+
+
+def open_postgres_storage(
+    args: argparse.Namespace,
+) -> PostgresRecordStorage:
     storage = PostgresRecordStorage(
-        database_url=database_url,
+        database_url=resolve_database_url(
+            args
+        ),
         application_name="hcp-reference-benchmark",
     )
 
@@ -580,6 +751,75 @@ def create_storage(
 
     storage.ping()
 
+    return storage
+
+
+def postgres_dataset_count(
+    storage: PostgresRecordStorage,
+    dataset: str,
+) -> int:
+    statement = select(
+        func.count()
+    ).select_from(
+        humanitarian_records_table
+    ).where(
+        humanitarian_records_table.c.source_client
+        == dataset_source_client(
+            dataset
+        )
+    )
+
+    try:
+        with storage.engine.connect() as connection:
+            value = connection.execute(
+                statement
+            ).scalar_one()
+
+        return int(
+            value
+        )
+
+    except SQLAlchemyError as exc:
+        raise SystemExit(
+            f"Unable to count PostgreSQL benchmark dataset: {exc}"
+        ) from exc
+
+
+def cleanup_postgres_dataset(
+    storage: PostgresRecordStorage,
+    dataset: str,
+) -> int:
+    statement = delete(
+        humanitarian_records_table
+    ).where(
+        humanitarian_records_table.c.source_client
+        == dataset_source_client(
+            dataset
+        )
+    )
+
+    try:
+        with storage.engine.begin() as connection:
+            result = connection.execute(
+                statement
+            )
+
+        return int(
+            result.rowcount
+            if result.rowcount is not None
+            else 0
+        )
+
+    except SQLAlchemyError as exc:
+        raise SystemExit(
+            f"Unable to remove PostgreSQL benchmark dataset: {exc}"
+        ) from exc
+
+
+def insert_postgres_records(
+    storage: PostgresRecordStorage,
+    records: list[HumanitarianRecord],
+) -> None:
     batch_size = 2_000
 
     for start in range(
@@ -594,22 +834,222 @@ def create_storage(
             ]
         )
 
-    return storage, None
 
-
-def cleanup_postgres_records(
-    storage: PostgresRecordStorage,
-    source_client: str,
+def prepare_dataset(
+    args: argparse.Namespace,
 ) -> None:
-    statement = delete(
-        humanitarian_records_table
-    ).where(
-        humanitarian_records_table.c.source_client
-        == source_client
+    assert args.dataset is not None
+
+    started_at = time.perf_counter()
+
+    if args.storage == "json":
+        path = json_dataset_path(
+            args.dataset_dir,
+            args.dataset,
+        )
+
+        if path.exists() and not args.replace:
+            raise SystemExit(
+                f"Dataset already exists: {path}. Use --replace to overwrite."
+            )
+
+        generation_started_at = time.perf_counter()
+        records = generate_records(
+            args.records,
+            seed=args.seed,
+            dataset=args.dataset,
+        )
+        generation_ms = (
+            time.perf_counter()
+            - generation_started_at
+        ) * 1_000
+
+        preparation_started_at = time.perf_counter()
+        write_json_dataset(
+            path,
+            records,
+        )
+        preparation_ms = (
+            time.perf_counter()
+            - preparation_started_at
+        ) * 1_000
+
+        print()
+        print("HCP Benchmark Dataset Prepared")
+        print("=" * 56)
+        print(f"Storage                  : json")
+        print(f"Dataset                  : {args.dataset}")
+        print(f"Records                  : {args.records:,}")
+        print(f"Path                     : {path.resolve()}")
+        print(f"Dataset generation       : {generation_ms:10.3f} ms")
+        print(f"Storage preparation      : {preparation_ms:10.3f} ms")
+        print(
+            f"Total elapsed            : "
+            f"{(time.perf_counter() - started_at) * 1_000:10.3f} ms"
+        )
+        print("=" * 56)
+        return
+
+    storage = open_postgres_storage(
+        args
     )
 
-    with storage.engine.begin() as connection:
-        connection.execute(statement)
+    try:
+        existing_count = postgres_dataset_count(
+            storage,
+            args.dataset,
+        )
+
+        if existing_count:
+            if not args.replace:
+                raise SystemExit(
+                    f"Dataset '{args.dataset}' already contains "
+                    f"{existing_count:,} PostgreSQL records. "
+                    "Use --replace to recreate it."
+                )
+
+            removed = cleanup_postgres_dataset(
+                storage,
+                args.dataset,
+            )
+
+            print(
+                f"Removed {removed:,} existing dataset records."
+            )
+
+        generation_started_at = time.perf_counter()
+        records = generate_records(
+            args.records,
+            seed=args.seed,
+            dataset=args.dataset,
+        )
+        generation_ms = (
+            time.perf_counter()
+            - generation_started_at
+        ) * 1_000
+
+        preparation_started_at = time.perf_counter()
+        insert_postgres_records(
+            storage,
+            records,
+        )
+        preparation_ms = (
+            time.perf_counter()
+            - preparation_started_at
+        ) * 1_000
+
+        persisted_count = postgres_dataset_count(
+            storage,
+            args.dataset,
+        )
+
+        print()
+        print("HCP Benchmark Dataset Prepared")
+        print("=" * 56)
+        print(f"Storage                  : postgres")
+        print(f"Dataset                  : {args.dataset}")
+        print(f"Records requested        : {args.records:,}")
+        print(f"Records persisted        : {persisted_count:,}")
+        print(f"Dataset generation       : {generation_ms:10.3f} ms")
+        print(f"Storage preparation      : {preparation_ms:10.3f} ms")
+        print(
+            f"Total elapsed            : "
+            f"{(time.perf_counter() - started_at) * 1_000:10.3f} ms"
+        )
+        print("=" * 56)
+
+    finally:
+        storage.close()
+
+
+def open_prepared_dataset(
+    args: argparse.Namespace,
+) -> tuple[RecordStorage, int]:
+    assert args.dataset is not None
+
+    if args.storage == "json":
+        path = json_dataset_path(
+            args.dataset_dir,
+            args.dataset,
+        )
+
+        if not path.exists():
+            raise SystemExit(
+                f"JSON dataset does not exist: {path}. "
+                "Run --action prepare first."
+            )
+
+        storage = JSONRecordStorage(
+            file_path=path,
+        )
+
+        return (
+            storage,
+            storage.count(),
+        )
+
+    storage = open_postgres_storage(
+        args
+    )
+    count = postgres_dataset_count(
+        storage,
+        args.dataset,
+    )
+
+    if count < 1:
+        storage.close()
+
+        raise SystemExit(
+            f"PostgreSQL dataset '{args.dataset}' does not exist or is empty. "
+            "Run --action prepare first."
+        )
+
+    return (
+        storage,
+        count,
+    )
+
+
+def cleanup_dataset(
+    args: argparse.Namespace,
+) -> None:
+    assert args.dataset is not None
+
+    if args.storage == "json":
+        path = json_dataset_path(
+            args.dataset_dir,
+            args.dataset,
+        )
+
+        if not path.exists():
+            raise SystemExit(
+                f"JSON dataset does not exist: {path}"
+            )
+
+        path.unlink()
+
+        print(
+            f"Removed JSON benchmark dataset: {path.resolve()}"
+        )
+        return
+
+    storage = open_postgres_storage(
+        args
+    )
+
+    try:
+        removed = cleanup_postgres_dataset(
+            storage,
+            args.dataset,
+        )
+
+        print(
+            f"Removed {removed:,} PostgreSQL records "
+            f"from dataset '{args.dataset}'."
+        )
+
+    finally:
+        storage.close()
 
 
 def execute_pipeline(
@@ -663,11 +1103,13 @@ def execute_pipeline(
 
     if correlations:
         case_started_at = time.perf_counter()
+
         case_builder.build(
             query=query,
             results=correlations,
             records=records,
         )
+
         case_builder_seconds = (
             time.perf_counter()
             - case_started_at
@@ -703,29 +1145,61 @@ def execute_pipeline(
         candidates_fetched=(
             timed_storage.last_candidate_count
         ),
-        search_results=len(records),
-        correlation_results=len(correlations),
+        search_results=len(
+            records
+        ),
+        correlation_results=len(
+            correlations
+        ),
         case_built=case_built,
     )
 
 
-def median_metric(
-    metrics: list[IterationMetrics],
-    field_name: str,
-) -> float:
-    return float(
-        statistics.median(
-            getattr(metric, field_name)
-            for metric in metrics
-        )
+def metric_statistics(
+    values: list[float],
+) -> MetricStatistics:
+    return MetricStatistics(
+        median_ms=float(
+            statistics.median(
+                values
+            )
+        ),
+        minimum_ms=min(
+            values
+        ),
+        maximum_ms=max(
+            values
+        ),
+        mean_ms=float(
+            statistics.fmean(
+                values
+            )
+        ),
+        standard_deviation_ms=(
+            float(
+                statistics.stdev(
+                    values
+                )
+            )
+            if len(values) > 1
+            else 0.0
+        ),
     )
 
 
 def summarize(
     *,
+    action: str,
+    storage: str,
+    dataset: str,
+    records: int,
     args: argparse.Namespace,
     settings: SearchSettings,
     metrics: list[IterationMetrics],
+    dataset_generation_ms: float | None = None,
+    storage_preparation_ms: float | None = None,
+    cleanup_ms: float | None = None,
+    lifecycle_total_ms: float | None = None,
 ) -> BenchmarkSummary:
     representative = metrics[
         len(metrics)
@@ -733,11 +1207,13 @@ def summarize(
     ]
 
     return BenchmarkSummary(
-        mode=args.mode,
-        storage=args.storage,
-        records=args.records,
+        action=action,
+        storage=storage,
+        dataset=dataset,
+        records=records,
         repeats=args.repeats,
         warmups=args.warmups,
+        result_limit=args.result_limit,
         candidate_fetch_limit=(
             settings.candidate_fetch_limit
         ),
@@ -747,26 +1223,35 @@ def summarize(
         max_candidate_fetch_limit=(
             settings.max_candidate_fetch_limit
         ),
-        result_limit=args.result_limit,
-        candidate_search_ms=median_metric(
-            metrics,
-            "candidate_search_ms",
+        candidate_search=metric_statistics(
+            [
+                metric.candidate_search_ms
+                for metric in metrics
+            ]
         ),
-        candidate_evaluation_ms=median_metric(
-            metrics,
-            "candidate_evaluation_ms",
+        candidate_evaluation=metric_statistics(
+            [
+                metric.candidate_evaluation_ms
+                for metric in metrics
+            ]
         ),
-        correlation_ms=median_metric(
-            metrics,
-            "correlation_ms",
+        correlation=metric_statistics(
+            [
+                metric.correlation_ms
+                for metric in metrics
+            ]
         ),
-        case_builder_ms=median_metric(
-            metrics,
-            "case_builder_ms",
+        case_builder=metric_statistics(
+            [
+                metric.case_builder_ms
+                for metric in metrics
+            ]
         ),
-        total_ms=median_metric(
-            metrics,
-            "total_ms",
+        total_pipeline=metric_statistics(
+            [
+                metric.total_ms
+                for metric in metrics
+            ]
         ),
         candidates_fetched=int(
             statistics.median(
@@ -787,13 +1272,24 @@ def summarize(
             )
         ),
         case_built=representative.case_built,
-        dataset_generation_ms=None,
-        storage_preparation_ms=None,
-        cleanup_ms=None,
-        lifecycle_total_ms=None,
         generated_at=datetime.now(
             timezone.utc
         ).isoformat(),
+        dataset_generation_ms=dataset_generation_ms,
+        storage_preparation_ms=storage_preparation_ms,
+        cleanup_ms=cleanup_ms,
+        lifecycle_total_ms=lifecycle_total_ms,
+    )
+
+
+def print_metric(
+    label: str,
+    metric: MetricStatistics,
+) -> None:
+    print(
+        f"{label:<25}: "
+        f"{metric.median_ms:10.3f} ms median "
+        f"[{metric.minimum_ms:.3f}–{metric.maximum_ms:.3f}]"
     )
 
 
@@ -802,10 +1298,11 @@ def print_summary(
 ) -> None:
     print()
     print("HCP Search Benchmark")
-    print("=" * 56)
-    print(f"Mode                     : {summary.mode}")
+    print("=" * 72)
+    print(f"Action                   : {summary.action}")
     print(f"Storage                  : {summary.storage}")
-    print(f"Generated records        : {summary.records:,}")
+    print(f"Dataset                  : {summary.dataset}")
+    print(f"Dataset records          : {summary.records:,}")
     print(f"Measured repetitions     : {summary.repeats}")
     print(f"Warm-up repetitions      : {summary.warmups}")
     print(f"Final result limit       : {summary.result_limit}")
@@ -813,30 +1310,30 @@ def print_summary(
     print(f"Search results           : {summary.search_results}")
     print(f"Correlation results      : {summary.correlation_results}")
     print(f"Humanitarian Case built  : {summary.case_built}")
-    print("-" * 56)
-    print(
-        f"Candidate search median  : "
-        f"{summary.candidate_search_ms:10.3f} ms"
+    print("-" * 72)
+    print_metric(
+        "Candidate search",
+        summary.candidate_search,
     )
-    print(
-        f"Candidate evaluation     : "
-        f"{summary.candidate_evaluation_ms:10.3f} ms"
+    print_metric(
+        "Candidate evaluation",
+        summary.candidate_evaluation,
     )
-    print(
-        f"Correlation median       : "
-        f"{summary.correlation_ms:10.3f} ms"
+    print_metric(
+        "Correlation",
+        summary.correlation,
     )
-    print(
-        f"Case builder median      : "
-        f"{summary.case_builder_ms:10.3f} ms"
+    print_metric(
+        "Case builder",
+        summary.case_builder,
     )
-    print(
-        f"Total pipeline median    : "
-        f"{summary.total_ms:10.3f} ms"
+    print_metric(
+        "Total pipeline",
+        summary.total_pipeline,
     )
 
-    if summary.mode == "lifecycle":
-        print("-" * 56)
+    if summary.action == "lifecycle":
+        print("-" * 72)
 
         if summary.dataset_generation_ms is not None:
             print(
@@ -862,7 +1359,7 @@ def print_summary(
                 f"{summary.lifecycle_total_ms:10.3f} ms"
             )
 
-    print("=" * 56)
+    print("=" * 72)
 
 
 def export_summary(
@@ -876,13 +1373,286 @@ def export_summary(
 
     output_path.write_text(
         json.dumps(
-            asdict(summary),
+            asdict(
+                summary
+            ),
             ensure_ascii=False,
             indent=2,
         )
         + "\n",
         encoding="utf-8",
     )
+
+
+def execute_measured_search(
+    *,
+    action: str,
+    storage_name: str,
+    dataset: str,
+    records: int,
+    storage: RecordStorage,
+    args: argparse.Namespace,
+    settings: SearchSettings,
+) -> BenchmarkSummary:
+    timed_storage = TimedRecordStorage(
+        storage
+    )
+    query = build_query(
+        dataset
+    )
+
+    for _ in range(
+        args.warmups
+    ):
+        execute_pipeline(
+            timed_storage=timed_storage,
+            query=query,
+            settings=settings,
+            result_limit=args.result_limit,
+        )
+
+    metrics = [
+        execute_pipeline(
+            timed_storage=timed_storage,
+            query=query,
+            settings=settings,
+            result_limit=args.result_limit,
+        )
+        for _ in range(
+            args.repeats
+        )
+    ]
+
+    return summarize(
+        action=action,
+        storage=storage_name,
+        dataset=dataset,
+        records=records,
+        args=args,
+        settings=settings,
+        metrics=metrics,
+    )
+
+
+def search_prepared_dataset(
+    args: argparse.Namespace,
+    settings: SearchSettings,
+) -> None:
+    assert args.dataset is not None
+
+    storage, record_count = open_prepared_dataset(
+        args
+    )
+
+    try:
+        summary = execute_measured_search(
+            action="search",
+            storage_name=args.storage,
+            dataset=args.dataset,
+            records=record_count,
+            storage=storage,
+            args=args,
+            settings=settings,
+        )
+
+        print_summary(
+            summary
+        )
+
+        if args.output is not None:
+            export_summary(
+                summary,
+                args.output,
+            )
+
+            print(
+                f"\nJSON result written to: "
+                f"{args.output.resolve()}"
+            )
+
+    finally:
+        storage.close()
+
+
+def run_lifecycle(
+    args: argparse.Namespace,
+    settings: SearchSettings,
+) -> None:
+    dataset = (
+        args.dataset
+        or (
+            "lifecycle-"
+            + datetime.now(
+                timezone.utc
+            ).strftime(
+                "%Y%m%dT%H%M%S%fZ"
+            )
+        )
+    )
+
+    lifecycle_started_at = time.perf_counter()
+
+    generation_started_at = time.perf_counter()
+    records = generate_records(
+        args.records,
+        seed=args.seed,
+        dataset=dataset,
+    )
+    generation_ms = (
+        time.perf_counter()
+        - generation_started_at
+    ) * 1_000
+
+    storage: RecordStorage | None = None
+    temporary_directory: (
+        tempfile.TemporaryDirectory[str]
+        | None
+    ) = None
+    preparation_ms = 0.0
+    cleanup_ms = 0.0
+    summary: BenchmarkSummary | None = None
+
+    try:
+        preparation_started_at = time.perf_counter()
+
+        if args.storage == "json":
+            temporary_directory = tempfile.TemporaryDirectory(
+                prefix="hcp-search-benchmark-"
+            )
+            path = (
+                Path(
+                    temporary_directory.name
+                )
+                / "hcp_records.json"
+            )
+
+            write_json_dataset(
+                path,
+                records,
+            )
+
+            storage = JSONRecordStorage(
+                file_path=path,
+            )
+
+        else:
+            postgres_storage = open_postgres_storage(
+                args
+            )
+            storage = postgres_storage
+
+            existing = postgres_dataset_count(
+                postgres_storage,
+                dataset,
+            )
+
+            if existing:
+                cleanup_postgres_dataset(
+                    postgres_storage,
+                    dataset,
+                )
+
+            insert_postgres_records(
+                postgres_storage,
+                records,
+            )
+
+        preparation_ms = (
+            time.perf_counter()
+            - preparation_started_at
+        ) * 1_000
+
+        base_summary = execute_measured_search(
+            action="lifecycle",
+            storage_name=args.storage,
+            dataset=dataset,
+            records=args.records,
+            storage=storage,
+            args=args,
+            settings=settings,
+        )
+
+        cleanup_started_at = time.perf_counter()
+
+        if (
+            args.storage == "postgres"
+            and isinstance(
+                storage,
+                PostgresRecordStorage,
+            )
+            and not args.keep_data
+        ):
+            cleanup_postgres_dataset(
+                storage,
+                dataset,
+            )
+
+        cleanup_ms = (
+            time.perf_counter()
+            - cleanup_started_at
+        ) * 1_000
+
+        summary = BenchmarkSummary(
+            **{
+                **asdict(
+                    base_summary
+                ),
+                "candidate_search": base_summary.candidate_search,
+                "candidate_evaluation": base_summary.candidate_evaluation,
+                "correlation": base_summary.correlation,
+                "case_builder": base_summary.case_builder,
+                "total_pipeline": base_summary.total_pipeline,
+                "dataset_generation_ms": generation_ms,
+                "storage_preparation_ms": preparation_ms,
+                "cleanup_ms": cleanup_ms,
+                "lifecycle_total_ms": (
+                    time.perf_counter()
+                    - lifecycle_started_at
+                )
+                * 1_000,
+            }
+        )
+
+        print_summary(
+            summary
+        )
+
+        if args.output is not None:
+            export_summary(
+                summary,
+                args.output,
+            )
+
+            print(
+                f"\nJSON result written to: "
+                f"{args.output.resolve()}"
+            )
+
+    finally:
+        if (
+            args.storage == "postgres"
+            and isinstance(
+                storage,
+                PostgresRecordStorage,
+            )
+            and not args.keep_data
+        ):
+            remaining = postgres_dataset_count(
+                storage,
+                dataset,
+            )
+
+            if remaining:
+                cleanup_postgres_dataset(
+                    storage,
+                    dataset,
+                )
+
+        if storage is not None:
+            storage.close()
+
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
 
 
 def main() -> int:
@@ -902,163 +1672,31 @@ def main() -> int:
         ),
     )
 
-    run_id = (
-        f"{BENCHMARK_SOURCE_PREFIX}:"
-        f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
-    )
-
-    lifecycle_started_at = time.perf_counter()
-
-    print(
-        f"Generating {args.records:,} canonical HCP records..."
-    )
-
-    generation_started_at = time.perf_counter()
-
-    records = generate_records(
-        args.records,
-        seed=args.seed,
-        run_id=run_id,
-    )
-
-    dataset_generation_ms = (
-        time.perf_counter()
-        - generation_started_at
-    ) * 1_000
-
-    storage: RecordStorage | None = None
-    temporary_directory: (
-        tempfile.TemporaryDirectory[str]
-        | None
-    ) = None
-    summary: BenchmarkSummary | None = None
-    cleanup_ms: float | None = None
-
-    try:
-        preparation_started_at = time.perf_counter()
-
-        storage, temporary_directory = create_storage(
-            args,
-            records,
+    if args.action == "prepare":
+        prepare_dataset(
+            args
         )
-
-        storage_preparation_ms = (
-            time.perf_counter()
-            - preparation_started_at
-        ) * 1_000
-
-        timed_storage = TimedRecordStorage(
-            storage
-        )
-        query = build_query()
-
-        for _ in range(args.warmups):
-            execute_pipeline(
-                timed_storage=timed_storage,
-                query=query,
-                settings=settings,
-                result_limit=args.result_limit,
-            )
-
-        measured_metrics = [
-            execute_pipeline(
-                timed_storage=timed_storage,
-                query=query,
-                settings=settings,
-                result_limit=args.result_limit,
-            )
-            for _ in range(args.repeats)
-        ]
-
-        summary = summarize(
-            args=args,
-            settings=settings,
-            metrics=measured_metrics,
-        )
-
-        if args.mode == "search-only":
-            print_summary(
-                summary
-            )
-
-            if args.output is not None:
-                export_summary(
-                    summary,
-                    args.output,
-                )
-
-                print(
-                    f"\nJSON result written to: "
-                    f"{args.output.resolve()}"
-                )
-
         return 0
 
-    finally:
-        cleanup_started_at = time.perf_counter()
+    if args.action == "search":
+        search_prepared_dataset(
+            args,
+            settings,
+        )
+        return 0
 
-        if (
-            args.storage == "postgres"
-            and isinstance(
-                storage,
-                PostgresRecordStorage,
-            )
-            and not args.keep_data
-        ):
-            try:
-                cleanup_postgres_records(
-                    storage,
-                    run_id,
-                )
-            except Exception as exc:
-                print(
-                    "WARNING: benchmark records could not be removed "
-                    f"automatically: {exc}",
-                    file=sys.stderr,
-                )
+    if args.action == "cleanup":
+        cleanup_dataset(
+            args
+        )
+        return 0
 
-        if storage is not None:
-            storage.close()
+    run_lifecycle(
+        args,
+        settings,
+    )
 
-        if temporary_directory is not None:
-            temporary_directory.cleanup()
-
-        cleanup_ms = (
-            time.perf_counter()
-            - cleanup_started_at
-        ) * 1_000
-
-        if (
-            args.mode == "lifecycle"
-            and summary is not None
-        ):
-            lifecycle_total_ms = (
-                time.perf_counter()
-                - lifecycle_started_at
-            ) * 1_000
-
-            lifecycle_summary = replace(
-                summary,
-                dataset_generation_ms=dataset_generation_ms,
-                storage_preparation_ms=storage_preparation_ms,
-                cleanup_ms=cleanup_ms,
-                lifecycle_total_ms=lifecycle_total_ms,
-            )
-
-            print_summary(
-                lifecycle_summary
-            )
-
-            if args.output is not None:
-                export_summary(
-                    lifecycle_summary,
-                    args.output,
-                )
-
-                print(
-                    f"\nJSON result written to: "
-                    f"{args.output.resolve()}"
-                )
+    return 0
 
 
 if __name__ == "__main__":
