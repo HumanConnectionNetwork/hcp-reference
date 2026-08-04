@@ -2,8 +2,12 @@
 """
 Official HCP search benchmark.
 
-The tool generates reproducible Humanitarian Records, executes the real HCP
-search pipeline and reports timing for:
+The tool generates reproducible Humanitarian Records and supports two modes:
+
+- lifecycle: prepare data, execute the search pipeline and clean up;
+- search-only: prepare data once and report only repeated search-pipeline timing.
+
+It reports timing for:
 
 - candidate retrieval;
 - semantic candidate evaluation;
@@ -42,7 +46,7 @@ import statistics
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -94,6 +98,7 @@ class IterationMetrics:
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkSummary:
+    mode: str
     storage: str
     records: int
     repeats: int
@@ -111,6 +116,10 @@ class BenchmarkSummary:
     search_results: int
     correlation_results: int
     case_built: bool
+    dataset_generation_ms: float | None
+    storage_preparation_ms: float | None
+    cleanup_ms: float | None
+    lifecycle_total_ms: float | None
     generated_at: str
 
 
@@ -192,6 +201,45 @@ class TimedRecordStorage(RecordStorage):
         self.storage.close()
 
 
+
+def load_local_environment() -> None:
+    """
+    Load simple KEY=VALUE entries from the repository-level .env file.
+
+    Existing environment variables always take precedence. This keeps the
+    benchmark aligned with the backend without adding a dotenv dependency.
+    """
+    env_path = PROJECT_ROOT / ".env"
+
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(
+        encoding="utf-8",
+    ).splitlines():
+        line = raw_line.strip()
+
+        if (
+            not line
+            or line.startswith("#")
+            or "=" not in line
+        ):
+            continue
+
+        name, value = line.split(
+            "=",
+            1,
+        )
+
+        name = name.strip()
+        value = value.strip().strip('"').strip("'")
+
+        if name:
+            os.environ.setdefault(
+                name,
+                value,
+            )
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -200,6 +248,17 @@ def parse_args() -> argparse.Namespace:
         )
     )
 
+    parser.add_argument(
+        "--mode",
+        choices=("lifecycle", "search-only"),
+        default="lifecycle",
+        help=(
+            "Benchmark mode. lifecycle preserves the complete automatic "
+            "generate/load/search/cleanup workflow. search-only prepares the "
+            "dataset once and reports only repeated search-pipeline timing. "
+            "Default: lifecycle."
+        ),
+    )
     parser.add_argument(
         "--storage",
         choices=("json", "postgres"),
@@ -674,6 +733,7 @@ def summarize(
     ]
 
     return BenchmarkSummary(
+        mode=args.mode,
         storage=args.storage,
         records=args.records,
         repeats=args.repeats,
@@ -727,6 +787,10 @@ def summarize(
             )
         ),
         case_built=representative.case_built,
+        dataset_generation_ms=None,
+        storage_preparation_ms=None,
+        cleanup_ms=None,
+        lifecycle_total_ms=None,
         generated_at=datetime.now(
             timezone.utc
         ).isoformat(),
@@ -739,6 +803,7 @@ def print_summary(
     print()
     print("HCP Search Benchmark")
     print("=" * 56)
+    print(f"Mode                     : {summary.mode}")
     print(f"Storage                  : {summary.storage}")
     print(f"Generated records        : {summary.records:,}")
     print(f"Measured repetitions     : {summary.repeats}")
@@ -769,6 +834,34 @@ def print_summary(
         f"Total pipeline median    : "
         f"{summary.total_ms:10.3f} ms"
     )
+
+    if summary.mode == "lifecycle":
+        print("-" * 56)
+
+        if summary.dataset_generation_ms is not None:
+            print(
+                f"Dataset generation       : "
+                f"{summary.dataset_generation_ms:10.3f} ms"
+            )
+
+        if summary.storage_preparation_ms is not None:
+            print(
+                f"Storage preparation      : "
+                f"{summary.storage_preparation_ms:10.3f} ms"
+            )
+
+        if summary.cleanup_ms is not None:
+            print(
+                f"Cleanup                  : "
+                f"{summary.cleanup_ms:10.3f} ms"
+            )
+
+        if summary.lifecycle_total_ms is not None:
+            print(
+                f"Lifecycle elapsed        : "
+                f"{summary.lifecycle_total_ms:10.3f} ms"
+            )
+
     print("=" * 56)
 
 
@@ -793,6 +886,8 @@ def export_summary(
 
 
 def main() -> int:
+    load_local_environment()
+
     args = parse_args()
 
     settings = SearchSettings(
@@ -812,9 +907,13 @@ def main() -> int:
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
     )
 
+    lifecycle_started_at = time.perf_counter()
+
     print(
         f"Generating {args.records:,} canonical HCP records..."
     )
+
+    generation_started_at = time.perf_counter()
 
     records = generate_records(
         args.records,
@@ -822,17 +921,31 @@ def main() -> int:
         run_id=run_id,
     )
 
+    dataset_generation_ms = (
+        time.perf_counter()
+        - generation_started_at
+    ) * 1_000
+
     storage: RecordStorage | None = None
     temporary_directory: (
         tempfile.TemporaryDirectory[str]
         | None
     ) = None
+    summary: BenchmarkSummary | None = None
+    cleanup_ms: float | None = None
 
     try:
+        preparation_started_at = time.perf_counter()
+
         storage, temporary_directory = create_storage(
             args,
             records,
         )
+
+        storage_preparation_ms = (
+            time.perf_counter()
+            - preparation_started_at
+        ) * 1_000
 
         timed_storage = TimedRecordStorage(
             storage
@@ -863,24 +976,27 @@ def main() -> int:
             metrics=measured_metrics,
         )
 
-        print_summary(
-            summary
-        )
-
-        if args.output is not None:
-            export_summary(
-                summary,
-                args.output,
+        if args.mode == "search-only":
+            print_summary(
+                summary
             )
 
-            print(
-                f"\nJSON result written to: "
-                f"{args.output.resolve()}"
-            )
+            if args.output is not None:
+                export_summary(
+                    summary,
+                    args.output,
+                )
+
+                print(
+                    f"\nJSON result written to: "
+                    f"{args.output.resolve()}"
+                )
 
         return 0
 
     finally:
+        cleanup_started_at = time.perf_counter()
+
         if (
             args.storage == "postgres"
             and isinstance(
@@ -906,6 +1022,43 @@ def main() -> int:
 
         if temporary_directory is not None:
             temporary_directory.cleanup()
+
+        cleanup_ms = (
+            time.perf_counter()
+            - cleanup_started_at
+        ) * 1_000
+
+        if (
+            args.mode == "lifecycle"
+            and summary is not None
+        ):
+            lifecycle_total_ms = (
+                time.perf_counter()
+                - lifecycle_started_at
+            ) * 1_000
+
+            lifecycle_summary = replace(
+                summary,
+                dataset_generation_ms=dataset_generation_ms,
+                storage_preparation_ms=storage_preparation_ms,
+                cleanup_ms=cleanup_ms,
+                lifecycle_total_ms=lifecycle_total_ms,
+            )
+
+            print_summary(
+                lifecycle_summary
+            )
+
+            if args.output is not None:
+                export_summary(
+                    lifecycle_summary,
+                    args.output,
+                )
+
+                print(
+                    f"\nJSON result written to: "
+                    f"{args.output.resolve()}"
+                )
 
 
 if __name__ == "__main__":
