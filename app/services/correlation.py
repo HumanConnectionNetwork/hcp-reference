@@ -73,6 +73,27 @@ class CorrelationService:
     # "Maria" frente a "Maria Atencio".
     CONTAINMENT_SIMILARITY_FLOOR = 0.82
 
+    # Evidencia dominante.
+    #
+    # Personas:
+    # - nombre;
+    # - edad;
+    # - localidad;
+    # - características.
+    #
+    # Animales:
+    # - especie;
+    # - raza;
+    # - tamaño;
+    # - características.
+    #
+    # Cuando todas las señales dominantes solicitadas están disponibles y
+    # coinciden fuertemente, la compatibilidad entra en la banda 99–100.
+    DOMINANT_MATCH_MINIMUM_SIMILARITY = 0.85
+    DOMINANT_PARTIAL_MINIMUM_SIMILARITY = 0.70
+    DOMINANT_SATURATION_FLOOR = 99.0
+    DOMINANT_SATURATION_CEILING = 100.0
+
     def correlate_records(
         self,
         query: HumanitarianQuery,
@@ -219,7 +240,13 @@ class CorrelationService:
             record=record,
         )
 
-        score = self._calculate_normalized_score(
+        base_score = self._calculate_normalized_score(
+            signals=signals,
+            subject_type=query.subject.type,
+        )
+
+        score = self._apply_dominant_evidence_saturation(
+            base_score=base_score,
             signals=signals,
             subject_type=query.subject.type,
         )
@@ -227,6 +254,7 @@ class CorrelationService:
         evidence_strength = self._calculate_evidence_strength(
             signals=signals,
             subject_type=query.subject.type,
+            compatibility_score=score,
         )
 
         return CorrelationResult(
@@ -1035,10 +1063,12 @@ class CorrelationService:
         subject_type: str,
     ) -> float:
         """
-        Calcula la compatibilidad usando únicamente datos declarados.
+        Calcula la compatibilidad base usando únicamente datos declarados.
 
-        Los datos ausentes en el registro conservan su peso disponible y por
-        eso reducen el porcentaje, sin convertirse en contradicciones.
+        Después, la evidencia dominante puede saturar un resultado casi
+        indistinguible hacia la banda 99–100. Los datos ausentes conservan su
+        peso disponible y reducen el porcentaje sin convertirse por sí solos
+        en contradicciones.
         """
         if not signals:
             return 0.0
@@ -1084,10 +1114,170 @@ class CorrelationService:
         )
 
     @classmethod
+    def _apply_dominant_evidence_saturation(
+        cls,
+        base_score: float,
+        signals: list[CorrelationSignal],
+        subject_type: str,
+    ) -> float:
+        """
+        Raise an already strong result into the 99–100 band when all dominant
+        evidence requested by the query is strongly compatible.
+
+        This does not confirm identity. It only expresses that the compared
+        observations are almost indistinguishable across the dominant fields.
+
+        Small differences in municipality, district or temporal distance may
+        adjust the final decimal but cannot meaningfully degrade a result whose
+        dominant evidence is complete and strong.
+        """
+        dominant_fields = cls._dominant_fields(
+            subject_type=subject_type,
+        )
+
+        dominant_signals = [
+            signal
+            for signal in signals
+            if signal.field in dominant_fields
+        ]
+
+        if not dominant_signals:
+            return base_score
+
+        # All dominant fields actually supplied in the query must be present.
+        if any(
+            signal.status
+            == CorrelationSignalStatus.NOT_AVAILABLE
+            for signal in dominant_signals
+        ):
+            return base_score
+
+        if any(
+            signal.status
+            == CorrelationSignalStatus.CONFLICT
+            for signal in dominant_signals
+        ):
+            return base_score
+
+        # A dominant partial match may still be useful, but saturation is
+        # reserved for uniformly strong dominant evidence.
+        if any(
+            signal.status
+            != CorrelationSignalStatus.MATCH
+            for signal in dominant_signals
+        ):
+            return base_score
+
+        secondary_penalty = cls._secondary_penalty(
+            signals=signals,
+            dominant_fields=dominant_fields,
+        )
+
+        saturated_score = (
+            cls.DOMINANT_SATURATION_CEILING
+            - secondary_penalty
+        )
+
+        return round(
+            max(
+                base_score,
+                max(
+                    cls.DOMINANT_SATURATION_FLOOR,
+                    saturated_score,
+                ),
+            ),
+            2,
+        )
+
+    @staticmethod
+    def _dominant_fields(
+        subject_type: str,
+    ) -> set[str]:
+        if subject_type == "animal":
+            return {
+                "subject.species",
+                "subject.breed",
+                "subject.size",
+                "subject.recognition_features",
+            }
+
+        return {
+            "subject.reported_label",
+            "subject.estimated_age",
+            "subject.recognition_features",
+            "observation.declared_location.locality",
+        }
+
+    @classmethod
+    def _secondary_penalty(
+        cls,
+        signals: list[CorrelationSignal],
+        dominant_fields: set[str],
+    ) -> float:
+        """
+        Calculate a small adjustment from non-dominant evidence.
+
+        Conflicts in country or first administrative level are not small
+        secondary differences. They prevent saturation entirely.
+        """
+        hard_spatial_fields = {
+            "observation.declared_location.country_code",
+            "observation.declared_location.admin_level_1",
+        }
+
+        for signal in signals:
+            if (
+                signal.field in hard_spatial_fields
+                and signal.status
+                == CorrelationSignalStatus.CONFLICT
+            ):
+                return 100.0
+
+        penalty = 0.0
+
+        for signal in signals:
+            if signal.field in dominant_fields:
+                continue
+
+            if signal.status == CorrelationSignalStatus.CONFLICT:
+                if signal.field == (
+                    "observation.declared_location.admin_level_2"
+                ):
+                    penalty += 0.35
+                elif signal.field == (
+                    "observation.declared_location.district"
+                ):
+                    penalty += 0.20
+                elif signal.field == "observation.temporal_distance":
+                    penalty += 0.35
+                else:
+                    penalty += 0.50
+
+            elif signal.status == CorrelationSignalStatus.PARTIAL_MATCH:
+                if signal.field == (
+                    "observation.declared_location.admin_level_2"
+                ):
+                    penalty += 0.15
+                elif signal.field == (
+                    "observation.declared_location.district"
+                ):
+                    penalty += 0.10
+                elif signal.field == "observation.temporal_distance":
+                    penalty += 0.20
+                else:
+                    penalty += 0.20
+
+        return min(
+            penalty,
+            1.0,
+        )
+
+    @classmethod
     def _calculate_evidence_strength(
         cls,
         signals: list[CorrelationSignal],
         subject_type: str,
+        compatibility_score: float,
     ) -> float:
         """
         Calcula la amplitud y disponibilidad de la evidencia.
@@ -1154,8 +1344,9 @@ class CorrelationService:
         )
 
         strength = (
-            availability_percentage * 0.65
-            + group_coverage * 0.35
+            availability_percentage * 0.60
+            + group_coverage * 0.30
+            + compatibility_score * 0.10
         )
 
         # Evita declarar evidencia muy alta cuando solo existe un grupo,
@@ -1170,6 +1361,32 @@ class CorrelationService:
             strength = min(
                 strength,
                 60.0,
+            )
+
+        # Coherencia pragmática: una compatibilidad extremadamente alta con
+        # cobertura amplia no debe presentarse como evidencia baja.
+        if (
+            compatibility_score >= 99.0
+            and len(available_groups) >= 4
+        ):
+            strength = max(
+                strength,
+                90.0,
+            )
+
+        elif (
+            compatibility_score >= 85.0
+            and len(available_groups) >= 3
+        ):
+            strength = max(
+                strength,
+                75.0,
+            )
+
+        elif compatibility_score < 50.0:
+            strength = min(
+                strength,
+                70.0,
             )
 
         return round(
