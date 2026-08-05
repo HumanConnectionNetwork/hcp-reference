@@ -1,4 +1,5 @@
 import unicodedata
+from datetime import datetime
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -33,11 +34,11 @@ class SearchService:
 
     The selection follows the HCP space-time model:
 
-    1. subject type;
-    2. declared geographic context;
-    3. name, age and recognition characteristics;
-    4. animal-specific descriptive evidence;
-    5. observation recency as a final ordering signal.
+    1. where: declared country and geographic hierarchy;
+    2. when: elapsed time and displacement plausibility;
+    3. who: reported name or label;
+    4. age: estimated human age;
+    5. characteristics: recognition evidence and animal descriptors.
 
     Search does not:
 
@@ -49,10 +50,17 @@ class SearchService:
     """
 
     # Spatial hierarchy used only for candidate ordering.
-    SPATIAL_EXACT_LOCALITY = 4
-    SPATIAL_SAME_REGION = 3
-    SPATIAL_SAME_COUNTRY = 2
-    SPATIAL_LEGACY_COMPATIBLE = 1
+    #
+    # The ordering follows the practical HCP sequence:
+    #
+    #     where -> when -> who -> age -> characteristics
+    #
+    # Same-country candidates always outrank exceptional international ones.
+    SPATIAL_EXACT_LOCALITY = 5
+    SPATIAL_SAME_REGION = 4
+    SPATIAL_SAME_COUNTRY = 3
+    SPATIAL_LEGACY_COMPATIBLE = 2
+    SPATIAL_INTERNATIONAL_PLAUSIBLE = 1
     SPATIAL_UNAVAILABLE = 0
 
     # Candidate-stage tolerances remain broader than final correlation.
@@ -60,6 +68,19 @@ class SearchService:
     PARTIAL_NAME_SIMILARITY = 0.52
     FEATURE_SIMILARITY = 0.22
     AGE_TOLERANCE = 5
+
+    # Cross-country exception.
+    #
+    # A record declared in another country is normally excluded. It may reach
+    # final correlation only when at least 72 hours have elapsed and the
+    # descriptive evidence is exceptionally strong.
+    INTERNATIONAL_MINIMUM_HOURS = 72.0
+    INTERNATIONAL_PERSON_NAME_SIMILARITY = 0.92
+    INTERNATIONAL_PERSON_FEATURE_SIMILARITY = 0.60
+    INTERNATIONAL_PERSON_AGE_TOLERANCE = 3
+    INTERNATIONAL_ANIMAL_SPECIES_SIMILARITY = 0.90
+    INTERNATIONAL_ANIMAL_BREED_SIMILARITY = 0.75
+    INTERNATIONAL_ANIMAL_FEATURE_SIMILARITY = 0.60
 
     def __init__(
         self,
@@ -81,9 +102,11 @@ class SearchService:
 
         - subject type must match;
         - event type never excludes a candidate;
-        - a record from another declared country is excluded;
-        - a record from another declared region is excluded from the main
-          candidate set;
+        - another declared country is excluded during the first 72 hours;
+        - after 72 hours, another country is considered only as an exceptional
+          candidate with very strong descriptive evidence;
+        - same-country records from another region remain lower-priority
+          candidates and must still pass descriptive evaluation;
         - district differences do not exclude records from the same locality;
         - a common descriptive word by itself is not sufficient;
         - a partial name such as "Maria" may match "Maria Atencio";
@@ -226,9 +249,13 @@ class SearchService:
 
         country -> first administrative level -> locality -> district.
 
-        Country and first administrative level are strong boundaries for the
-        primary search. Locality determines candidate priority. District is a
-        supporting detail and never excludes a candidate by itself.
+        Country is the first spatial gate. Another country is normally
+        excluded and becomes exceptionally plausible only after 72 hours with
+        very strong descriptive support.
+
+        Within the same country, region and locality determine candidate
+        priority. District is supporting context and never excludes a
+        candidate by itself.
         """
         query_location = self._declared_location(
             getattr(
@@ -266,6 +293,12 @@ class SearchService:
                 and record_country
                 and query_country != record_country
             ):
+                if self._international_candidate_is_plausible(
+                    query=query,
+                    record=record,
+                ):
+                    return self.SPATIAL_INTERNATIONAL_PLAUSIBLE
+
                 return None
 
             query_region = self._normalize_text(
@@ -291,7 +324,7 @@ class SearchService:
                     record_region,
                 )
             ):
-                return None
+                return self.SPATIAL_SAME_COUNTRY
 
             query_locality = self._normalize_text(
                 getattr(
@@ -336,6 +369,254 @@ class SearchService:
             return self.SPATIAL_LEGACY_COMPATIBLE
 
         return None
+
+    def _international_candidate_is_plausible(
+        self,
+        query: HumanitarianQuery,
+        record: HumanitarianRecord,
+    ) -> bool:
+        """
+        Apply the exceptional cross-country space-time gate.
+        """
+        elapsed_hours = self._elapsed_hours(
+            query=query,
+            record=record,
+        )
+
+        if (
+            elapsed_hours is None
+            or elapsed_hours < self.INTERNATIONAL_MINIMUM_HOURS
+        ):
+            return False
+
+        if query.subject.type == "animal":
+            return self._international_animal_support(
+                query=query,
+                record=record,
+            )
+
+        return self._international_person_support(
+            query=query,
+            record=record,
+        )
+
+    def _international_person_support(
+        self,
+        query: HumanitarianQuery,
+        record: HumanitarianRecord,
+    ) -> bool:
+        query_subject = query.subject
+        record_subject = record.subject
+
+        name_similarity = self._optional_text_similarity(
+            query_subject.reported_label,
+            record_subject.reported_label,
+        )
+
+        if (
+            name_similarity is None
+            or name_similarity
+            < self.INTERNATIONAL_PERSON_NAME_SIMILARITY
+        ):
+            return False
+
+        query_age = getattr(
+            query_subject,
+            "estimated_age",
+            None,
+        )
+        record_age = getattr(
+            record_subject,
+            "estimated_age",
+            None,
+        )
+
+        if query_age is not None:
+            if record_age is None:
+                return False
+
+            if (
+                abs(query_age - record_age)
+                > self.INTERNATIONAL_PERSON_AGE_TOLERANCE
+            ):
+                return False
+
+        query_features = getattr(
+            query_subject,
+            "recognition_features",
+            None,
+        )
+
+        if query_features:
+            feature_similarity = self._optional_text_similarity(
+                query_features,
+                getattr(
+                    record_subject,
+                    "recognition_features",
+                    None,
+                ),
+            )
+
+            if (
+                feature_similarity is None
+                or feature_similarity
+                < self.INTERNATIONAL_PERSON_FEATURE_SIMILARITY
+            ):
+                return False
+
+        return bool(
+            query_age is not None
+            or query_features
+        )
+
+    def _international_animal_support(
+        self,
+        query: HumanitarianQuery,
+        record: HumanitarianRecord,
+    ) -> bool:
+        query_subject = query.subject
+        record_subject = record.subject
+
+        species_similarity = self._optional_text_similarity(
+            getattr(
+                query_subject,
+                "species",
+                None,
+            ),
+            getattr(
+                record_subject,
+                "species",
+                None,
+            ),
+        )
+
+        if (
+            species_similarity is None
+            or species_similarity
+            < self.INTERNATIONAL_ANIMAL_SPECIES_SIMILARITY
+        ):
+            return False
+
+        required_secondary_signals = 0
+        matched_secondary_signals = 0
+
+        query_breed = getattr(
+            query_subject,
+            "breed",
+            None,
+        )
+
+        if query_breed:
+            required_secondary_signals += 1
+            breed_similarity = self._optional_text_similarity(
+                query_breed,
+                getattr(
+                    record_subject,
+                    "breed",
+                    None,
+                ),
+            )
+
+            if (
+                breed_similarity is not None
+                and breed_similarity
+                >= self.INTERNATIONAL_ANIMAL_BREED_SIMILARITY
+            ):
+                matched_secondary_signals += 1
+
+        query_size = self._normalize_text(
+            getattr(
+                query_subject,
+                "size",
+                None,
+            )
+            or ""
+        )
+
+        if query_size:
+            required_secondary_signals += 1
+            record_size = self._normalize_text(
+                getattr(
+                    record_subject,
+                    "size",
+                    None,
+                )
+                or ""
+            )
+
+            if query_size == record_size:
+                matched_secondary_signals += 1
+
+        query_features = getattr(
+            query_subject,
+            "recognition_features",
+            None,
+        )
+
+        if query_features:
+            required_secondary_signals += 1
+            feature_similarity = self._optional_text_similarity(
+                query_features,
+                getattr(
+                    record_subject,
+                    "recognition_features",
+                    None,
+                ),
+            )
+
+            if (
+                feature_similarity is not None
+                and feature_similarity
+                >= self.INTERNATIONAL_ANIMAL_FEATURE_SIMILARITY
+            ):
+                matched_secondary_signals += 1
+
+        if required_secondary_signals == 0:
+            return False
+
+        return matched_secondary_signals == required_secondary_signals
+
+    @classmethod
+    def _elapsed_hours(
+        cls,
+        query: HumanitarianQuery,
+        record: HumanitarianRecord,
+    ) -> float | None:
+        query_observation = getattr(
+            query,
+            "observation",
+            None,
+        )
+
+        if query_observation is None:
+            return None
+
+        searched_at = cls._as_datetime(
+            getattr(
+                query_observation,
+                "searched_at",
+                None,
+            )
+        )
+        observed_at = cls._as_datetime(
+            getattr(
+                record.observation,
+                "observed_at",
+                None,
+            )
+        )
+
+        if searched_at is None or observed_at is None:
+            return None
+
+        elapsed_seconds = (
+            searched_at - observed_at
+        ).total_seconds()
+
+        if elapsed_seconds < 0:
+            return None
+
+        return elapsed_seconds / 3_600.0
 
     def _descriptive_rank(
         self,
@@ -806,6 +1087,26 @@ class SearchService:
             "declared_location",
             None,
         )
+
+    @staticmethod
+    def _as_datetime(
+        value: object,
+    ) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(
+                    value.replace(
+                        "Z",
+                        "+00:00",
+                    )
+                )
+            except ValueError:
+                return None
+
+        return None
 
     @staticmethod
     def _normalize_code(
