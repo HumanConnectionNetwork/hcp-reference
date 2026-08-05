@@ -39,25 +39,31 @@ class CorrelationService:
     El resultado expresa compatibilidad y nunca confirma identidad.
     """
 
-    # Evidencia descriptiva común.
-    REPORTED_LABEL_WEIGHT = 25.0
-    ESTIMATED_AGE_WEIGHT = 15.0
-    RECOGNITION_FEATURES_WEIGHT = 20.0
+    # Evidencia descriptiva para personas.
+    HUMAN_REPORTED_LABEL_WEIGHT = 30.0
+    HUMAN_ESTIMATED_AGE_WEIGHT = 16.0
+    HUMAN_RECOGNITION_FEATURES_WEIGHT = 22.0
 
-    # Evidencia espacial.
+    # Evidencia descriptiva para animales.
+    #
+    # El nombre puede ser desconocido, repetido o cambiado. Por eso especie,
+    # raza, tamaño y características visibles pesan más que el nombre.
+    ANIMAL_REPORTED_LABEL_WEIGHT = 8.0
+    ANIMAL_RECOGNITION_FEATURES_WEIGHT = 24.0
+    SPECIES_WEIGHT = 22.0
+    ANIMAL_SIZE_WEIGHT = 12.0
+    BREED_WEIGHT = 18.0
+
+    # Evidencia espacial. País y región siguen siendo límites fuertes.
     COUNTRY_WEIGHT = 10.0
     ADMIN_LEVEL_1_WEIGHT = 10.0
     ADMIN_LEVEL_2_WEIGHT = 5.0
     LOCALITY_WEIGHT = 10.0
-    DISTRICT_WEIGHT = 3.0
+    DISTRICT_WEIGHT = 4.0
 
-    # Evidencia temporal.
-    TEMPORAL_WEIGHT = 2.0
-
-    # Evidencia específica de animales.
-    SPECIES_WEIGHT = 12.0
-    ANIMAL_SIZE_WEIGHT = 4.0
-    BREED_WEIGHT = 8.0
+    # Evidencia temporal. Aporta plausibilidad sin anular por sí sola una
+    # coincidencia descriptiva y espacial fuerte.
+    TEMPORAL_WEIGHT = 3.0
 
     # Tolerancias descriptivas.
     STRONG_TEXT_SIMILARITY = 0.85
@@ -156,7 +162,11 @@ class CorrelationService:
             field="subject.reported_label",
             query_value=query.subject.reported_label,
             record_value=record.subject.reported_label,
-            weight=self.REPORTED_LABEL_WEIGHT,
+            weight=(
+                self.HUMAN_REPORTED_LABEL_WEIGHT
+                if query.subject.type == "human"
+                else self.ANIMAL_REPORTED_LABEL_WEIGHT
+            ),
             description="reported name or label",
             containment_floor=self.CONTAINMENT_SIMILARITY_FLOOR,
         )
@@ -181,7 +191,11 @@ class CorrelationService:
             field="subject.recognition_features",
             query_value=query.subject.recognition_features,
             record_value=record.subject.recognition_features,
-            weight=self.RECOGNITION_FEATURES_WEIGHT,
+            weight=(
+                self.HUMAN_RECOGNITION_FEATURES_WEIGHT
+                if query.subject.type == "human"
+                else self.ANIMAL_RECOGNITION_FEATURES_WEIGHT
+            ),
             description="recognition features",
             containment_floor=0.55,
         )
@@ -206,11 +220,13 @@ class CorrelationService:
         )
 
         score = self._calculate_normalized_score(
-            signals
+            signals=signals,
+            subject_type=query.subject.type,
         )
 
         evidence_strength = self._calculate_evidence_strength(
-            signals
+            signals=signals,
+            subject_type=query.subject.type,
         )
 
         return CorrelationResult(
@@ -895,7 +911,7 @@ class CorrelationService:
 
         if age_difference == 0:
             status = CorrelationSignalStatus.MATCH
-            contribution = self.ESTIMATED_AGE_WEIGHT
+            contribution = self.HUMAN_ESTIMATED_AGE_WEIGHT
             explanation = (
                 "The estimated ages are equal."
             )
@@ -903,7 +919,7 @@ class CorrelationService:
         elif age_difference <= 3:
             status = CorrelationSignalStatus.MATCH
             contribution = (
-                self.ESTIMATED_AGE_WEIGHT
+                self.HUMAN_ESTIMATED_AGE_WEIGHT
                 * (
                     1.0
                     - age_difference * 0.08
@@ -921,7 +937,7 @@ class CorrelationService:
                 .PARTIAL_MATCH
             )
             contribution = (
-                self.ESTIMATED_AGE_WEIGHT
+                self.HUMAN_ESTIMATED_AGE_WEIGHT
                 * 0.50
             )
             explanation = (
@@ -1016,6 +1032,7 @@ class CorrelationService:
     def _calculate_normalized_score(
         cls,
         signals: list[CorrelationSignal],
+        subject_type: str,
     ) -> float:
         """
         Calcula la compatibilidad usando únicamente datos declarados.
@@ -1026,7 +1043,9 @@ class CorrelationService:
         if not signals:
             return 0.0
 
-        weights = cls._signal_weights()
+        weights = cls._signal_weights(
+            subject_type=subject_type,
+        )
 
         total_available_weight = 0.0
         total_contribution = 0.0
@@ -1068,6 +1087,7 @@ class CorrelationService:
     def _calculate_evidence_strength(
         cls,
         signals: list[CorrelationSignal],
+        subject_type: str,
     ) -> float:
         """
         Calcula la amplitud y disponibilidad de la evidencia.
@@ -1083,7 +1103,9 @@ class CorrelationService:
         if not signals:
             return 0.0
 
-        weights = cls._signal_weights()
+        weights = cls._signal_weights(
+            subject_type=subject_type,
+        )
 
         total_requested_weight = 0.0
         available_weight = 0.0
@@ -1164,26 +1186,27 @@ class CorrelationService:
     @classmethod
     def _signal_weights(
         cls,
+        subject_type: str,
     ) -> dict[str, float]:
+        """Return the semantic weight map for one subject type."""
+        if subject_type == "animal":
+            reported_label_weight = cls.ANIMAL_REPORTED_LABEL_WEIGHT
+            recognition_features_weight = (
+                cls.ANIMAL_RECOGNITION_FEATURES_WEIGHT
+            )
+        else:
+            reported_label_weight = cls.HUMAN_REPORTED_LABEL_WEIGHT
+            recognition_features_weight = (
+                cls.HUMAN_RECOGNITION_FEATURES_WEIGHT
+            )
+
         return {
-            "subject.reported_label": (
-                cls.REPORTED_LABEL_WEIGHT
-            ),
-            "subject.estimated_age": (
-                cls.ESTIMATED_AGE_WEIGHT
-            ),
-            "subject.recognition_features": (
-                cls.RECOGNITION_FEATURES_WEIGHT
-            ),
-            "subject.species": (
-                cls.SPECIES_WEIGHT
-            ),
-            "subject.size": (
-                cls.ANIMAL_SIZE_WEIGHT
-            ),
-            "subject.breed": (
-                cls.BREED_WEIGHT
-            ),
+            "subject.reported_label": reported_label_weight,
+            "subject.estimated_age": cls.HUMAN_ESTIMATED_AGE_WEIGHT,
+            "subject.recognition_features": recognition_features_weight,
+            "subject.species": cls.SPECIES_WEIGHT,
+            "subject.size": cls.ANIMAL_SIZE_WEIGHT,
+            "subject.breed": cls.BREED_WEIGHT,
             (
                 "observation.declared_location."
                 "country_code"
@@ -1205,12 +1228,9 @@ class CorrelationService:
                 "district"
             ): cls.DISTRICT_WEIGHT,
             "observation.reported_location": (
-                cls.ADMIN_LEVEL_1_WEIGHT
-                + cls.LOCALITY_WEIGHT
+                cls.ADMIN_LEVEL_1_WEIGHT + cls.LOCALITY_WEIGHT
             ),
-            "observation.temporal_distance": (
-                cls.TEMPORAL_WEIGHT
-            ),
+            "observation.temporal_distance": cls.TEMPORAL_WEIGHT,
         }
 
     @staticmethod
@@ -1361,6 +1381,17 @@ class CorrelationService:
         if (
             first_normalized
             == second_normalized
+        ):
+            return 1.0
+
+        first_token_list = first_normalized.split()
+        second_token_list = second_normalized.split()
+
+        if (
+            first_token_list
+            and second_token_list
+            and len(first_token_list) == len(second_token_list)
+            and set(first_token_list) == set(second_token_list)
         ):
             return 1.0
 
